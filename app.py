@@ -10,12 +10,19 @@ from src.ai_engine import GeminiError, analyze_report, check_connection
 from src.document_parser import basic_metadata, validate_upload
 from src.excel_exporter import build_excel_bytes
 from src.record_utils import (
-    COLUMNS, EVIDENCE_FIELDS, NAAC_ATTRIBUTES, deduplicate_records,
-    normalize_record, session_summary,
+    COLUMNS,
+    EVIDENCE_FIELDS,
+    NAAC_ATTRIBUTES,
+    deduplicate_records,
+    session_summary,
 )
-from src.validation_engine import validate_cross_document, validation_summary
 
-st.set_page_config(page_title="IQAC Analyzer", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(
+    page_title="IQAC Analyzer",
+    page_icon="📘",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 
 def setting(name: str, default: str = "") -> str:
@@ -30,68 +37,358 @@ def setting(name: str, default: str = "") -> str:
 
 MODEL = setting("GEMINI_MODEL", "gemini-3.8-flash")
 API_KEY = setting("GEMINI_API_KEY")
-INSTITUTION = setting("INSTITUTION_NAME", "Ramsheth Thakur College of Commerce & Science")
+INSTITUTION = setting(
+    "INSTITUTION_NAME",
+    "Ramsheth Thakur College of Commerce & Science",
+)
 MAX_FILE_MB = int(setting("MAX_FILE_MB", "50"))
 
 
 for key, default in {
-    "records": [], "summaries": [], "analysis_done": False, "excel": None, "validation_issues": [],
+    "records": [],
+    "summaries": [],
+    "analysis_done": False,
+    "excel": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
 
-st.markdown("""
+# ---------------------------------------------------------------------------
+# Premium, lightweight UI
+# ---------------------------------------------------------------------------
+st.markdown(
+    """
 <style>
-.block-container {max-width: 1500px; padding-top: 2rem;}
-.iqac-title {font-size: 2.35rem; font-weight: 800; letter-spacing: -0.02em;}
-.iqac-sub {font-size: 1.02rem; color: #667085; margin-bottom: 1rem;}
-.info-card {padding: 1rem 1.1rem; border: 1px solid #e5e7eb; border-radius: 12px; background: #f8fafc;}
-.small {font-size: .86rem; color: #667085;}
+:root {
+    --iqac-navy: #17324d;
+    --iqac-blue: #2563eb;
+    --iqac-sky: #eff6ff;
+    --iqac-green: #15803d;
+    --iqac-amber: #b45309;
+    --iqac-red: #b91c1c;
+    --iqac-border: #e5e7eb;
+    --iqac-muted: #667085;
+}
+
+.block-container {
+    max-width: 1480px;
+    padding-top: 1.25rem;
+    padding-bottom: 3rem;
+}
+
+header[data-testid="stHeader"] {
+    background: transparent;
+}
+
+.iqac-hero {
+    border: 1px solid #dbe5f0;
+    border-radius: 22px;
+    padding: 1.65rem 1.8rem;
+    margin-bottom: 1.2rem;
+    background:
+        radial-gradient(circle at 90% 15%, rgba(37,99,235,.10), transparent 28%),
+        linear-gradient(135deg, #ffffff 0%, #f7faff 55%, #eef5ff 100%);
+    box-shadow: 0 8px 28px rgba(23,50,77,.07);
+}
+
+.iqac-brand {
+    color: var(--iqac-blue);
+    font-size: .82rem;
+    font-weight: 800;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    margin-bottom: .3rem;
+}
+
+.iqac-title {
+    color: var(--iqac-navy);
+    font-size: clamp(2rem, 4vw, 3rem);
+    line-height: 1.08;
+    font-weight: 850;
+    letter-spacing: -.035em;
+    margin: 0;
+}
+
+.iqac-subtitle {
+    color: #526071;
+    font-size: 1.02rem;
+    margin-top: .65rem;
+    max-width: 900px;
+    line-height: 1.6;
+}
+
+.iqac-pill-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .55rem;
+    margin-top: 1rem;
+}
+
+.iqac-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: .35rem;
+    border: 1px solid #d9e4f2;
+    background: rgba(255,255,255,.85);
+    border-radius: 999px;
+    padding: .38rem .72rem;
+    color: #334155;
+    font-size: .82rem;
+    font-weight: 650;
+}
+
+.section-title {
+    color: var(--iqac-navy);
+    font-size: 1.35rem;
+    font-weight: 800;
+    margin: 1.2rem 0 .55rem;
+}
+
+.section-caption {
+    color: var(--iqac-muted);
+    margin-bottom: .75rem;
+}
+
+.metric-card {
+    border: 1px solid var(--iqac-border);
+    border-radius: 16px;
+    padding: 1rem 1.05rem;
+    background: #fff;
+    box-shadow: 0 4px 16px rgba(15,23,42,.045);
+    min-height: 108px;
+}
+
+.metric-label {
+    color: #667085;
+    font-size: .78rem;
+    font-weight: 750;
+    text-transform: uppercase;
+    letter-spacing: .055em;
+}
+
+.metric-value {
+    color: var(--iqac-navy);
+    font-size: 1.8rem;
+    font-weight: 850;
+    line-height: 1.1;
+    margin-top: .35rem;
+}
+
+.metric-help {
+    color: #98a2b3;
+    font-size: .78rem;
+    margin-top: .3rem;
+}
+
+.status-card {
+    border-radius: 16px;
+    padding: .9rem 1rem;
+    border: 1px solid #dbe5f0;
+    background: #f8fbff;
+}
+
+.status-dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    margin-right: .45rem;
+    background: #16a34a;
+}
+
+.upload-card {
+    border: 1px dashed #a9bdd5;
+    border-radius: 18px;
+    padding: .8rem;
+    background: #fbfdff;
+}
+
+.footer-note {
+    color: #98a2b3;
+    font-size: .78rem;
+    line-height: 1.55;
+}
+
+div[data-testid="stFileUploader"] {
+    border-radius: 14px;
+}
+
+div[data-testid="stDataEditor"] {
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    overflow: hidden;
+}
+
+div[data-testid="stDataFrame"] {
+    border-radius: 14px;
+}
+
+.stButton > button, .stDownloadButton > button {
+    border-radius: 10px;
+    font-weight: 700;
+}
+
+button[kind="primary"] {
+    box-shadow: 0 5px 14px rgba(37,99,235,.20);
+}
+
+div[data-testid="stExpander"] {
+    border-radius: 14px;
+}
+
+.iqac-empty {
+    text-align: center;
+    padding: 2.4rem 1rem;
+    border: 1px dashed #d0d5dd;
+    border-radius: 16px;
+    background: #fafafa;
+    color: #667085;
+}
+
+.small-muted {
+    color: #667085;
+    font-size: .86rem;
+}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-st.markdown('<div class="iqac-title">📊 IQAC Analyzer</div>', unsafe_allow_html=True)
-st.markdown('<div class="iqac-sub">AI-powered IQAC activity extraction, evidence checking and Excel master-data preparation</div>', unsafe_allow_html=True)
 
-st.caption(f"{INSTITUTION}  •  Gemini-powered  •  Human verification required before official use")
+def metric_card(label: str, value: str | int, help_text: str = "") -> None:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">{label}</div>
+            <div class="metric-value">{value}</div>
+            <div class="metric-help">{help_text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-with st.expander("How this analyzer works", expanded=True):
-    st.markdown("""
-    **1. Upload one or more IQAC reports → 2. Gemini reads the complete document, including scanned pages, tables, photographs and handwriting → 3. It identifies every distinct activity → 4. It connects the activity summary with whatever supporting evidence is actually present → 5. You review/edit the extracted rows → 6. Download `IQAC_Master_Data.xlsx`.**
 
-    **Important:** supporting documents are variable. A missing Programme Table, Invitation, News clipping, etc. does **not** automatically make an activity invalid. The application reports evidence gaps separately.
-    """)
+def status_label(status: str) -> str:
+    value = str(status)
+    if value == "Analyzed":
+        return "✅ Analyzed"
+    if value.startswith("AI Error"):
+        return "⚠️ AI Error"
+    if value.startswith("Error"):
+        return "❌ Error"
+    return value
 
-status_ok, status_msg = check_connection(API_KEY, MODEL) if API_KEY else (False, "Gemini API key is not configured.")
 
-left, right = st.columns([4, 1])
-with left:
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+st.markdown(
+    f"""
+    <div class="iqac-hero">
+        <div class="iqac-brand">IQAC • QUALITY DATA WORKSPACE</div>
+        <h1 class="iqac-title">IQAC Analyzer</h1>
+        <div class="iqac-subtitle">
+            Convert activity reports into structured, traceable IQAC master data
+            with AI-assisted extraction, evidence review and NAAC reference mapping.
+        </div>
+        <div class="iqac-pill-row">
+            <span class="iqac-pill">🤖 Gemini AI</span>
+            <span class="iqac-pill">📄 PDF / DOCX / TXT</span>
+            <span class="iqac-pill">🔎 Evidence-aware</span>
+            <span class="iqac-pill">🧑‍💼 Human verification</span>
+            <span class="iqac-pill">📊 Excel export</span>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    f"""
+    <div class="small-muted">
+        <b>{INSTITUTION}</b> &nbsp;•&nbsp; Current session processing
+        &nbsp;•&nbsp; Official NAAC scoring is not calculated by this application.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------------------------
+# Connection + instructions
+# ---------------------------------------------------------------------------
+status_ok, status_msg = (
+    check_connection(API_KEY, MODEL)
+    if API_KEY
+    else (False, "Gemini API key is not configured.")
+)
+
+st.markdown('<div class="section-title">🚀 Start a new analysis</div>', unsafe_allow_html=True)
+
+connection_col, info_col = st.columns([1, 2])
+with connection_col:
     if status_ok:
-        st.success("Gemini AI is ready. Staff do not need to select a model or provider.")
+        st.markdown(
+            '<div class="status-card"><span class="status-dot"></span>'
+            '<b>AI engine ready</b><br><span class="small-muted">'
+            'Gemini is connected and ready for analysis.</span></div>',
+            unsafe_allow_html=True,
+        )
     else:
-        st.error("AI analysis is not ready. The administrator must configure `GEMINI_API_KEY` in Streamlit Secrets.")
-with right:
-    st.metric("AI Engine", "Gemini")
+        st.error(
+            "Gemini AI is not ready. The administrator must configure "
+            "`GEMINI_API_KEY` in Streamlit Secrets."
+        )
 
+with info_col:
+    with st.expander("ℹ️ How it works", expanded=False):
+        st.markdown(
+            """
+            **1. Upload reports** → **2. AI reads the complete document** →
+            **3. Distinct activities are identified** → **4. Structured fields,
+            evidence and NAAC reference mapping are extracted** →
+            **5. You review/edit the results** → **6. Download the IQAC workbook.**
+
+            Missing information is reported as missing; the application should
+            not invent facts that are absent from the source.
+            """
+        )
+
+st.markdown('<div class="upload-card">', unsafe_allow_html=True)
 uploads = st.file_uploader(
-    "Upload IQAC Report(s)",
+    "📁 Upload IQAC report(s)",
     type=["pdf", "docx", "txt"],
     accept_multiple_files=True,
     help=f"Upload complete activity reports. Maximum {MAX_FILE_MB} MB per file.",
 )
+st.markdown("</div>", unsafe_allow_html=True)
 
-c1, c2 = st.columns([3, 1])
-with c1:
-    analyze = st.button("🔍 Analyze Reports", type="primary", width='stretch', disabled=not status_ok)
-with c2:
-    clear = st.button("🧹 Clear Session", width='stretch')
+if uploads:
+    total_mb = sum(len(x.getvalue()) for x in uploads) / (1024 * 1024)
+    st.caption(
+        f"📎 {len(uploads)} file(s) selected  •  "
+        f"{total_mb:.1f} MB total  •  Maximum {MAX_FILE_MB} MB per file"
+    )
+
+action_col, clear_col = st.columns([3, 1])
+with action_col:
+    analyze = st.button(
+        "🔍 Analyze Reports",
+        type="primary",
+        width="stretch",
+        disabled=not status_ok,
+    )
+with clear_col:
+    clear = st.button("🧹 Clear Session", width="stretch")
 
 if clear:
-    for key in ["records", "summaries", "analysis_done", "excel", "validation_issues", "editor_df"]:
+    for key in ["records", "summaries", "analysis_done", "excel", "editor_df"]:
         st.session_state.pop(key, None)
     st.rerun()
 
+# ---------------------------------------------------------------------------
+# Processing
+# ---------------------------------------------------------------------------
 if analyze:
     if not uploads:
         st.warning("Please upload at least one report.")
@@ -103,247 +400,280 @@ if analyze:
 
     for idx, uploaded in enumerate(uploads, 1):
         raw = uploaded.getvalue()
-        meta = basic_metadata(uploaded.name, raw)
+        # Keep metadata available for future diagnostics without displaying
+        # implementation details to staff.
+        _ = basic_metadata(uploaded.name, raw)
+
         try:
             validate_upload(uploaded.name, raw, MAX_FILE_MB)
-            progress.progress((idx - 1) / len(uploads), text=f"Analyzing {uploaded.name}…")
-            file_records, report_meta = analyze_report(raw, uploaded.name, MODEL, API_KEY)
+            progress.progress(
+                (idx - 1) / len(uploads),
+                text=f"Analyzing {uploaded.name}…",
+            )
+
+            file_records, report_meta = analyze_report(
+                raw,
+                uploaded.name,
+                MODEL,
+                API_KEY,
+            )
             records.extend(file_records)
-            summaries.append({
-                "Source Report": uploaded.name,
-                "Type": report_meta.get("Document Type", "Not Identified"),
-                "Academic Year": report_meta.get("Academic Year", "Not Identified"),
-                "Activities Detected": len(file_records),
-                "Status": "Analyzed",
-            })
+
+            summaries.append(
+                {
+                    "Source Report": uploaded.name,
+                    "Type": report_meta.get("Document Type", "Not Identified"),
+                    "Academic Year": report_meta.get(
+                        "Academic Year", "Not Identified"
+                    ),
+                    "Activities Detected": len(file_records),
+                    "Status": "Analyzed",
+                }
+            )
+
         except GeminiError as exc:
-            summaries.append({"Source Report": uploaded.name, "Type": "—", "Academic Year": "—", "Activities Detected": 0, "Status": f"AI Error: {exc}"})
+            summaries.append(
+                {
+                    "Source Report": uploaded.name,
+                    "Type": "—",
+                    "Academic Year": "—",
+                    "Activities Detected": 0,
+                    "Status": f"AI Error: {exc}",
+                }
+            )
         except Exception as exc:
-            summaries.append({"Source Report": uploaded.name, "Type": "—", "Academic Year": "—", "Activities Detected": 0, "Status": f"Error: {exc}"})
-        progress.progress(idx / len(uploads), text=f"Finished {idx} of {len(uploads)} report(s)")
+            summaries.append(
+                {
+                    "Source Report": uploaded.name,
+                    "Type": "—",
+                    "Academic Year": "—",
+                    "Activities Detected": 0,
+                    "Status": f"Error: {exc}",
+                }
+            )
+
+        progress.progress(
+            idx / len(uploads),
+            text=f"Finished {idx} of {len(uploads)} report(s)",
+        )
 
     records, duplicate_count = deduplicate_records(records)
 
-    # Run conservative validation after extraction/deduplication. Validation never
-    # deletes records or invents facts; it only adds review flags and issue notes.
-    records, validation_issues = validate_cross_document(records)
-
     st.session_state.records = records
-    st.session_state.validation_issues = validation_issues
     st.session_state.summaries = summaries
     st.session_state.analysis_done = True
-    st.session_state.excel = build_excel_bytes(records) if records else None
+    st.session_state.excel = (
+        build_excel_bytes(records) if records else None
+    )
+
     if duplicate_count:
-        st.info(f"{duplicate_count} possible duplicate extraction record(s) were retained and flagged for review.")
-
-    vsummary = validation_summary(records, validation_issues)
-    if vsummary["records_with_issues"]:
-        st.warning(
-            f"Validation found {vsummary['records_with_issues']} record(s) with data-quality issues "
-            f"and {len(validation_issues)} cross-document issue(s). Review them before official use."
+        st.info(
+            f"{duplicate_count} repeated extraction record(s) were suppressed "
+            "within the same source report. Please still review the final rows."
         )
 
+    st.success(
+        f"Analysis complete — {len(records)} activity record(s) extracted "
+        f"from {len(uploads)} report(s)."
+    )
+
+# ---------------------------------------------------------------------------
+# Results
+# ---------------------------------------------------------------------------
 if st.session_state.analysis_done:
-    summary = session_summary(st.session_state.records)
-    st.subheader("Analysis Summary")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Reports", len(st.session_state.summaries))
-    m2.metric("Activities Detected", summary["activities"])
-    m3.metric("Needs Verification", summary["needs_verification"])
-    m4.metric("Activities with Evidence Gaps", summary["evidence_gaps"])
-    m5.metric("Possible Duplicates", summary["possible_duplicates"])
-    m6.metric("Validation Issues", len(st.session_state.get("validation_issues", [])))
+    records = st.session_state.records
+    summary = session_summary(records)
 
-    if st.session_state.summaries:
-        st.dataframe(pd.DataFrame(st.session_state.summaries), width="stretch", hide_index=True)
+    st.markdown('<div class="section-title">📊 Analysis overview</div>', unsafe_allow_html=True)
 
-    if st.session_state.records:
-        st.subheader("🔎 Verification Center")
-        st.caption(
-            "Review the extracted records before using them as official IQAC data. "
-            "AI extraction is not treated as final approval."
-        )
+    cols = st.columns(5)
+    with cols[0]:
+        metric_card("Reports", len(st.session_state.summaries), "Files processed")
+    with cols[1]:
+        metric_card("Activities", summary["activities"], "Activity records extracted")
+    with cols[2]:
+        metric_card("Verification", summary["needs_verification"], "Records still requiring review")
+    with cols[3]:
+        metric_card("Evidence gaps", summary["evidence_gaps"], "Records with evidence gaps")
+    with cols[4]:
+        metric_card("Duplicates", summary["possible_duplicates"], "Possible duplicate records")
 
-        records_df = pd.DataFrame(st.session_state.records).reindex(columns=COLUMNS).fillna("")
+    tab_overview, tab_review, tab_evidence, tab_export = st.tabs(
+        ["📋 Reports", "📝 Review Activities", "🧾 Evidence", "📥 Export"]
+    )
 
-        vf1, vf2, vf3 = st.columns([1.4, 1.4, 2.2])
-        with vf1:
-            verification_filter = st.selectbox(
-                "Verification status",
-                ["All", "Needs Verification", "Possible Duplicate", "Verified"],
-                key="verification_filter",
-            )
-        with vf2:
-            confidence_filter = st.selectbox(
-                "Confidence",
-                ["All", "High", "Medium", "Low"],
-                key="confidence_filter",
-            )
-        with vf3:
-            search_text = st.text_input(
-                "Search activity / department / source",
-                placeholder="e.g. tree plantation, NSS, seminar...",
-                key="verification_search",
-            )
-
-        visible_mask = pd.Series(True, index=records_df.index)
-        if verification_filter != "All":
-            visible_mask &= records_df["Verification Status"].eq(verification_filter)
-        if confidence_filter != "All":
-            visible_mask &= records_df["Extraction Confidence"].str.startswith(confidence_filter, na=False)
-        if search_text.strip():
-            needle = search_text.strip().lower()
-            search_cols = ["Activity Title", "Organizing Department", "Organizing Committee", "Source Report"]
-            text_match = pd.Series(False, index=records_df.index)
-            for col in search_cols:
-                text_match |= records_df[col].astype(str).str.lower().str.contains(needle, regex=False, na=False)
-            visible_mask &= text_match
-
-        visible_df = records_df.loc[visible_mask].copy()
-
-        vc1, vc2, vc3, vc4 = st.columns(4)
-        vc1.metric("Records Shown", len(visible_df))
-        vc2.metric("Need Verification", int((records_df["Verification Status"] == "Needs Verification").sum()))
-        vc3.metric("Possible Duplicates", int((records_df["Verification Status"] == "Possible Duplicate").sum()))
-        vc4.metric("Low Confidence", int(records_df["Extraction Confidence"].astype(str).str.startswith("Low", na=False).sum()))
-
-        if not visible_df.empty:
-            issue_rows = []
-            for _, row in visible_df.iterrows():
-                missing = str(row.get("Missing Information", ""))
-                gaps = str(row.get("Evidence Gaps", ""))
-                issues = []
-                if missing and missing != "None identified":
-                    issues.append(f"Missing: {missing}")
-                if gaps and gaps != "None identified":
-                    issues.append(f"Evidence: {gaps}")
-                if str(row.get("Verification Status", "")) == "Possible Duplicate":
-                    issues.append(f"Duplicate of: {row.get('Duplicate Of', 'Not identified')}")
-                issue_rows.append({
-                    "Record ID": row.get("Record ID", ""),
-                    "Activity": row.get("Activity Title", ""),
-                    "Confidence": row.get("Extraction Confidence", ""),
-                    "Issues": " | ".join(issues) if issues else "No automatic issue detected",
-                })
-            st.dataframe(pd.DataFrame(issue_rows), width="stretch", hide_index=True)
-        else:
-            st.info("No records match the selected verification filters.")
-
-        # Only records currently visible in the verification filter are edited.
-        # This prevents an accidental bulk edit of hundreds of unrelated records.
-        st.subheader("✏️ Review / Edit Records")
-        st.caption(
-            "Edit the visible records. After editing, missing-information, evidence-gap and "
-            "confidence fields are recalculated automatically."
-        )
-
-        if not visible_df.empty:
-            editor_columns = [c for c in COLUMNS if c in visible_df.columns]
-            edited = st.data_editor(
-                visible_df[editor_columns],
-                key="verification_editor",
+    with tab_overview:
+        st.markdown("### Processing status")
+        if st.session_state.summaries:
+            display_summary = pd.DataFrame(st.session_state.summaries).copy()
+            if "Status" in display_summary:
+                display_summary["Status"] = display_summary["Status"].map(
+                    status_label
+                )
+            st.dataframe(
+                display_summary,
                 width="stretch",
-                height=620,
                 hide_index=True,
-                num_rows="fixed",
-                disabled=["Record ID", "Source Report", "Extraction Status", "Extraction Confidence", "Missing Information", "Evidence Gaps"],
                 column_config={
-                    "NAAC Attribute": st.column_config.SelectboxColumn(
-                        "NAAC Attribute", options=NAAC_ATTRIBUTES, width="large"
+                    "Source Report": st.column_config.TextColumn(
+                        "Report", width="large"
                     ),
-                    "Verification Status": st.column_config.SelectboxColumn(
-                        "Verification Status",
-                        options=["Needs Verification", "Verified", "Possible Duplicate"],
-                        width="medium",
+                    "Activities Detected": st.column_config.NumberColumn(
+                        "Activities", format="%d"
                     ),
                 },
             )
 
-            if st.button("💾 Apply Review Changes", type="primary", width="stretch"):
-                edited_records = edited.to_dict(orient="records")
-                visible_ids = set(visible_df["Record ID"].astype(str))
-                by_id = {str(r.get("Record ID")): r for r in st.session_state.records}
-
-                for edited_record in edited_records:
-                    record_id = str(edited_record.get("Record ID", ""))
-                    original = by_id.get(record_id)
-                    if original is None or record_id not in visible_ids:
-                        continue
-
-                    # Preserve system-generated metadata and duplicate fields.
-                    old_id = original.get("Record ID", record_id)
-                    old_source = original.get("Source Report", "Not Identified")
-                    old_duplicate = {
-                        k: original[k] for k in ("Duplicate Of", "Duplicate Similarity") if k in original
-                    }
-                    verification_status = edited_record.get("Verification Status", original.get("Verification Status", "Needs Verification"))
-
-                    refreshed = normalize_record(
-                        edited_record,
-                        old_source,
-                        1,
-                        str(edited_record.get("Source Page", original.get("Source Page", "Not Identified"))),
-                    )
-                    refreshed["Record ID"] = old_id
-                    refreshed["Source Report"] = old_source
-                    refreshed["Verification Status"] = verification_status
-                    refreshed.update(old_duplicate)
-                    by_id[record_id] = refreshed
-
-                reviewed_records = list(by_id.values())
-                reviewed_records, reviewed_issues = validate_cross_document(reviewed_records)
-                st.session_state.records = reviewed_records
-                st.session_state.validation_issues = reviewed_issues
-                st.session_state.excel = build_excel_bytes(st.session_state.records)
-                st.success("Review changes applied and validation recalculated.")
-                st.rerun()
-
-        st.subheader("🧪 Data Quality Validation")
-        validation_issues = st.session_state.get("validation_issues", [])
-        if validation_issues:
-            vs = validation_summary(st.session_state.records, validation_issues)
-            q1, q2, q3, q4 = st.columns(4)
-            q1.metric("Records with Issues", vs["records_with_issues"])
-            q2.metric("High Severity", vs["high_severity_issues"])
-            q3.metric("Quantitative Issues", vs["quantitative_inconsistencies"])
-            q4.metric("Cross-document Issues", vs["cross_document_inconsistencies"])
-
-            st.caption(
-                "Validation is conservative: records are retained, factual conflicts are flagged, "
-                "and missing information is not replaced with guesses."
+        if not records:
+            st.markdown(
+                """
+                <div class="iqac-empty">
+                    <div style="font-size:2rem;">📄</div>
+                    <b>No activity records were extracted.</b><br>
+                    <span>Check the report type, AI configuration and processing status above.</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
+
+    if records:
+        with tab_review:
+            st.markdown("### Review extracted activities")
+            st.caption(
+                "Review AI-extracted information before using the workbook as an official IQAC record."
+            )
+
+            df = (
+                pd.DataFrame(records)
+                .reindex(columns=COLUMNS)
+                .fillna("")
+            )
+
+            edited = st.data_editor(
+                df,
+                key="editor_df",
+                width="stretch",
+                height=640,
+                hide_index=True,
+                num_rows="fixed",
+                disabled=[
+                    "Record ID",
+                    "Source Report",
+                    "Extraction Status",
+                ],
+                column_config={
+                    "Activity Title": st.column_config.TextColumn(
+                        "Activity Title", width="large"
+                    ),
+                    "Activity Type": st.column_config.TextColumn(
+                        "Activity Type", width="medium"
+                    ),
+                    "Organizing Department": st.column_config.TextColumn(
+                        "Department", width="medium"
+                    ),
+                    "NAAC Attribute": st.column_config.SelectboxColumn(
+                        "NAAC Attribute",
+                        options=NAAC_ATTRIBUTES,
+                        width="large",
+                    ),
+                    "Verification Status": st.column_config.SelectboxColumn(
+                        "Verification Status",
+                        options=[
+                            "Needs Verification",
+                            "Verified",
+                            "Possible Duplicate",
+                        ],
+                        width="medium",
+                    ),
+                    "Extraction Confidence": st.column_config.TextColumn(
+                        "Confidence", width="medium"
+                    ),
+                },
+            )
+
+            st.session_state.records = edited.to_dict(orient="records")
+            st.session_state.excel = build_excel_bytes(
+                st.session_state.records
+            )
+
+            st.success(
+                "Review changes are applied to the current session and will be included in the downloaded workbook."
+            )
+
+        with tab_evidence:
+            st.markdown("### Evidence register")
+            st.caption(
+                "Evidence availability is informational. A missing item is not automatically a failed activity."
+            )
+
+            evidence_columns = (
+                ["Record ID", "Activity Title", "Source Report"]
+                + EVIDENCE_FIELDS
+                + ["Evidence Gaps"]
+            )
+            evidence_df = (
+                pd.DataFrame(st.session_state.records)
+                .reindex(columns=evidence_columns)
+                .fillna("")
+            )
+
             st.dataframe(
-                pd.DataFrame(validation_issues),
+                evidence_df,
                 width="stretch",
                 hide_index=True,
             )
-        else:
-            st.success("No cross-document or quantitative inconsistencies were detected automatically.")
 
-        st.subheader("📋 Evidence Review")
-        evidence_columns = ["Record ID", "Activity Title", "Source Report"] + EVIDENCE_FIELDS + ["Evidence Gaps"]
-        evidence_df = pd.DataFrame(st.session_state.records).reindex(columns=evidence_columns).fillna("")
-        st.dataframe(evidence_df, width="stretch", hide_index=True)
+        with tab_export:
+            st.markdown("### Download your IQAC workbook")
+            st.caption(
+                "The workbook contains the structured records generated by the current session."
+            )
 
-        st.subheader("📊 Current Master Data")
-        st.dataframe(
-            pd.DataFrame(st.session_state.records).reindex(columns=COLUMNS).fillna(""),
-            width="stretch",
-            hide_index=True,
-        )
+            export_col, note_col = st.columns([2, 3])
+            with export_col:
+                st.download_button(
+                    "⬇️ Download IQAC_Master_Data.xlsx",
+                    data=st.session_state.excel,
+                    file_name="IQAC_Master_Data.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                    type="primary",
+                    width="stretch",
+                )
+            with note_col:
+                st.markdown(
+                    """
+                    <div class="status-card">
+                        <b>Before official use</b><br>
+                        <span class="small-muted">
+                        Review extracted records, evidence gaps and NAAC reference
+                        mappings. AI output should be verified by the responsible IQAC team.
+                        </span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-        st.session_state.excel = build_excel_bytes(st.session_state.records)
-        st.download_button(
-            "⬇️ Download IQAC_Master_Data.xlsx",
-            data=st.session_state.excel,
-            file_name="IQAC_Master_Data.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            width="stretch",
-        )
-    else:
-        st.warning("No activities were extracted. Check the report type and Gemini configuration, then try again.")
-
+# ---------------------------------------------------------------------------
+# Footer
+# ---------------------------------------------------------------------------
 st.divider()
-st.markdown("**Privacy / processing:** uploaded reports are processed for the current Streamlit session. The app does not maintain its own database or permanent document archive. For Gemini processing, the report is transmitted to Google's Gemini API; uploaded Gemini Files are deleted by the app after analysis on a best-effort basis and otherwise expire automatically according to Google's Files API retention. Do not upload documents you are not authorized to send to a third-party AI service.")
-st.markdown('<div class="small">The analyzer prepares data for IQAC use; it does not calculate or certify an official NAAC accreditation score.</div>', unsafe_allow_html=True)
+st.markdown(
+    f"""
+    <div class="footer-note">
+        <b>{INSTITUTION}</b> • IQAC Analyzer<br>
+        Uploaded reports are processed for the current Streamlit session.
+        The application does not maintain its own permanent document archive.
+        For Gemini processing, the report is transmitted to Google's Gemini API;
+        uploaded Gemini Files are deleted by the app on a best-effort basis and
+        otherwise expire according to Google's Files API retention.
+        Do not upload documents you are not authorized to send to a third-party AI service.
+        <br><br>
+        <b>Important:</b> This application prepares IQAC data and provides reference
+        mappings. It does not calculate or certify an official NAAC accreditation score.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
