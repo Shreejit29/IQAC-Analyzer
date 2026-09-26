@@ -11,7 +11,7 @@ from src.document_parser import basic_metadata, validate_upload
 from src.excel_exporter import build_excel_bytes
 from src.record_utils import COLUMNS, EVIDENCE_FIELDS, NAAC_ATTRIBUTES, deduplicate_records, session_summary
 
-st.set_page_config(page_title="IQAC Analyzer", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="IQAC Report Analyzer", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
 
 
 def setting(name: str, default: str = "") -> str:
