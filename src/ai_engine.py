@@ -83,6 +83,12 @@ class EvidenceChecklist(BaseModel):
     other_evidence: str = Field(description="Present, Absent, or Unclear; mention the type in the same field.")
 
 
+class FieldTrace(BaseModel):
+    field: str = Field(description="Canonical field name, for example Activity Date, Activity Title, or Total Participants.")
+    source_page: str = Field(default="Not Identified", description="PDF page number or compact page range directly supporting the field.")
+    confidence: str = Field(default="Not Identified", description="Extraction confidence from 0-100, not factual certainty.")
+
+
 class Activity(BaseModel):
     academic_year: str = "Not Identified"
     activity_date: str = "Not Identified"
@@ -118,12 +124,12 @@ class Activity(BaseModel):
     missing_information: str = "Not Identified"
     evidence_gaps: str = "Not Identified"
     extraction_notes: str = "Not Identified"
-    # Field-level traceability. Keys should match the canonical field names below.
-    # Values are compact source-page references such as "1", "1-2", or "6-8".
-    field_sources: dict[str, str] = Field(default_factory=dict)
-    # Field-level confidence as percentages or decimal strings. These are evidence-based extraction estimates,
-    # not probabilities of factual truth.
-    field_confidence: dict[str, str] = Field(default_factory=dict)
+    # Fixed-list traceability is used instead of dynamic dictionaries because the
+    # Gemini structured-output schema must not require a dynamic additionalProperties object.
+    field_trace: list[FieldTrace] = Field(
+        default_factory=list,
+        description="Field-level source page and extraction-confidence records."
+    )
 
 
 class ReportAnalysis(BaseModel):
@@ -575,28 +581,35 @@ _CANONICAL_FIELD_ALIASES = {
 }
 
 
+def _trace_parts(a: Activity) -> tuple[dict[str, str], dict[str, str]]:
+    """Convert fixed-list Gemini traceability into the legacy dict representation."""
+    sources: dict[str, str] = {}
+    confidence: dict[str, str] = {}
+    for item in (a.field_trace or []):
+        if not item.field:
+            continue
+        field = str(item.field).strip()
+        if item.source_page:
+            sources[field] = str(item.source_page).strip()
+        if item.confidence:
+            confidence[field] = str(item.confidence).strip()
+    return sources, confidence
+
+
 def _compact_field_sources(values: dict[str, str] | None) -> str:
-    """Serialize page traceability compactly for Excel/UI while preserving field names."""
     if not values:
         return "Not Identified"
-    parts = []
-    for key, value in values.items():
-        if value is None:
-            continue
-        field = _CANONICAL_FIELD_ALIASES.get(str(key), str(key))
-        page = str(value).strip()
-        if not page:
-            continue
-        parts.append(f"{field}: {page}")
+    parts = [f"{k}: {v}" for k, v in values.items() if str(v).strip()]
     return " | ".join(parts) if parts else "Not Identified"
 
 
 def _normalize_field_confidence(values: dict[str, str] | None, a: Activity) -> str:
-    """Normalize field confidence into a compact 'Field: xx%' string."""
-    values = values or {}
+    # Keep the existing human-readable master-field value while deriving it
+    # from the new fixed-list traceability representation.
+    if not values:
+        return "Not Identified"
     parts = []
-    for key, value in values.items():
-        field = _CANONICAL_FIELD_ALIASES.get(str(key), str(key))
+    for field, value in values.items():
         try:
             raw = str(value).strip().replace("%", "")
             score = float(raw)
@@ -609,9 +622,9 @@ def _normalize_field_confidence(values: dict[str, str] | None, a: Activity) -> s
                 parts.append(f"{field}: {value}")
     return " | ".join(parts) if parts else "Not Identified"
 
-
 def _map_activity(a: Activity, source_file: str, index: int, report_year: str) -> dict[str, str]:
     e = a.evidence
+    field_sources, field_confidence = _trace_parts(a)
     mapped: dict[str, Any] = {
         "Academic Year": a.academic_year if a.academic_year != "Not Identified" else report_year,
         "Activity Date": a.activity_date,
@@ -659,8 +672,8 @@ def _map_activity(a: Activity, source_file: str, index: int, report_year: str) -
         "Activity Summary Pages": a.activity_summary_pages,
         "Missing Information": a.missing_information,
         "Evidence Gaps": a.evidence_gaps,
-        "Field Sources": _compact_field_sources(a.field_sources),
-        "Field Confidence": _normalize_field_confidence(a.field_confidence, a),
+        "Field Sources": _compact_field_sources(field_sources),
+        "Field Confidence": _normalize_field_confidence(field_confidence, a),
     }
     # Validate Gemini's mapping against the exact supplied catalog. If Gemini misses either field or produces an
     # inconsistent attribute/metric pair, use the deterministic activity classifier as a safety net.
