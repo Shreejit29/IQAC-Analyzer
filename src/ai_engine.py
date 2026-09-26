@@ -83,6 +83,13 @@ class EvidenceChecklist(BaseModel):
     other_evidence: str = Field(description="Present, Absent, or Unclear; mention the type in the same field.")
 
 
+class EvidenceTrace(BaseModel):
+    evidence_type: str = Field(description="Evidence category.")
+    status: str = Field(default="Not Identified", description="Present, Not Identified, or Not Applicable.")
+    source_page: str = Field(default="Not Identified", description="Supporting PDF page or page range.")
+    notes: str = Field(default="", description="Short source-grounded note.")
+
+
 class FieldTrace(BaseModel):
     field: str = Field(description="Canonical field name, for example Activity Date, Activity Title, or Total Participants.")
     source_page: str = Field(default="Not Identified", description="PDF page number or compact page range directly supporting the field.")
@@ -130,6 +137,10 @@ class Activity(BaseModel):
         default_factory=list,
         description="Field-level source page and extraction-confidence records."
     )
+    evidence_trace: list[EvidenceTrace] = Field(
+        default_factory=list,
+        description="Structured evidence checklist with source-grounded status and page references."
+    )
 
 
 class ReportAnalysis(BaseModel):
@@ -166,6 +177,8 @@ CORE RULES
 12. For every important extracted field, provide a field_sources entry using the canonical field name and the page(s)
     that directly support that value. Use "Not Identified" when the value is not supported. Do not invent page numbers.
 13. For every important extracted field, provide field_confidence as an extraction-evidence estimate from 0-100.
+14. Populate evidence_trace using the fixed evidence categories. Use Present, Not Identified, or Not Applicable only from actual document evidence. For Present evidence, provide its supporting page or page range. Do not invent evidence or page numbers.
+15. Attendance, photographs, feedback, proposals and notices normally support an activity and must not become separate activities.
     Use high confidence only when the value is clearly readable and directly supported; use lower confidence for
     partial/uncertain OCR or indirect evidence. For a missing field use 0 or "Not Identified".
 14. If multiple pages support a field, list them compactly, e.g. "1-2" or "6-8". If the field is supported by the
@@ -581,6 +594,58 @@ _CANONICAL_FIELD_ALIASES = {
 }
 
 
+EVIDENCE_CATEGORIES = [
+    "Proposal", "Notice", "Invitation", "Programme/Schedule", "Attendance",
+    "Event Report", "Photographs", "Geotagged Photographs", "Feedback",
+    "Feedback Analysis", "News/Publicity", "Certificate", "Other Evidence",
+]
+
+
+def _evidence_trace_parts(a: Activity) -> list[dict[str, str]]:
+    aliases = {
+        "program": "Programme/Schedule", "programme": "Programme/Schedule",
+        "schedule": "Programme/Schedule", "program schedule": "Programme/Schedule",
+        "photo": "Photographs", "photos": "Photographs", "photograph": "Photographs",
+        "geotagged photo": "Geotagged Photographs", "geotagged photos": "Geotagged Photographs",
+        "news": "News/Publicity", "publicity": "News/Publicity",
+        "certificate": "Certificate", "certificates": "Certificate",
+    }
+    result, seen = [], set()
+    for item in (a.evidence_trace or []):
+        category = str(item.evidence_type or "").strip()
+        if not category:
+            continue
+        category = aliases.get(category.lower().replace("_"," ").replace("-"," "), category)
+        if category.lower() in seen:
+            continue
+        seen.add(category.lower())
+        raw = str(item.status or "Not Identified").strip().lower()
+        status = "Present" if raw in {"present","available","found","yes"} else (
+            "Not Applicable" if raw in {"na","n/a","not applicable"} else "Not Identified"
+        )
+        result.append({
+            "Evidence Type": category,
+            "Status": status,
+            "Source Page": str(item.source_page or "Not Identified").strip(),
+            "Notes": str(item.notes or "").strip(),
+        })
+    return result
+
+
+def _evidence_summary(items: list[dict[str, str]]) -> str:
+    if not items:
+        return "Not Identified"
+    return " | ".join(
+        f"{x['Evidence Type']}: {x['Status']}" +
+        (f" (p. {x['Source Page']})" if x["Source Page"] else "")
+        for x in items
+    )
+
+
+def _evidence_present_count(items: list[dict[str, str]]) -> int:
+    return sum(x["Status"] == "Present" for x in items)
+
+
 def _trace_parts(a: Activity) -> tuple[dict[str, str], dict[str, str]]:
     """Convert fixed-list Gemini traceability into the legacy dict representation."""
     sources: dict[str, str] = {}
@@ -625,6 +690,7 @@ def _normalize_field_confidence(values: dict[str, str] | None, a: Activity) -> s
 def _map_activity(a: Activity, source_file: str, index: int, report_year: str) -> dict[str, str]:
     e = a.evidence
     field_sources, field_confidence = _trace_parts(a)
+    evidence_trace = _evidence_trace_parts(a)
     mapped: dict[str, Any] = {
         "Academic Year": a.academic_year if a.academic_year != "Not Identified" else report_year,
         "Activity Date": a.activity_date,
@@ -651,6 +717,9 @@ def _map_activity(a: Activity, source_file: str, index: int, report_year: str) -
         "Feedback": a.feedback,
         "Evidence Available": a.evidence_available,
         "Evidence Link": a.evidence_link,
+        "Evidence Trace": _evidence_summary(evidence_trace),
+        "Evidence Present Count": str(_evidence_present_count(evidence_trace)),
+        "Evidence Trace Details": evidence_trace,
         "Proposal": e.proposal,
         "Notice": e.notice,
         "Programme Table": e.programme_table,
