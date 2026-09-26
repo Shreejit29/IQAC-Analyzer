@@ -11,7 +11,7 @@ from src.document_parser import basic_metadata, validate_upload
 from src.excel_exporter import build_excel_bytes
 from src.record_utils import COLUMNS, EVIDENCE_FIELDS, NAAC_ATTRIBUTES, deduplicate_records, session_summary
 
-st.set_page_config(page_title="IQAC Report Analyzer", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="IQAC Analyzer", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
 
 
 def setting(name: str, default: str = "") -> str:
@@ -357,7 +357,7 @@ html[data-theme="dark"] [data-testid="stWidgetLabel"] {
 st.markdown(f"""
 <div class="iqac-hero">
     <div class="iqac-kicker">Institutional Quality Assurance</div>
-    <div class="iqac-title">📊 IQAC Report Analyzer</div>
+    <div class="iqac-title">📊 IQAC Analyzer</div>
     <div class="iqac-sub">
         AI-powered extraction, evidence review, validation and master-data preparation
         for IQAC activity reports.
@@ -513,6 +513,75 @@ if st.session_state.analysis_done:
         )
         st.session_state.records = edited.to_dict(orient="records")
         st.session_state.excel = build_excel_bytes(st.session_state.records)
+
+        st.markdown("""
+        <div class="iqac-section">
+            <div class="iqac-section-bar"></div>
+            <div>
+                <div class="iqac-section-title">🔎 Source Traceability</div>
+                <div class="iqac-section-sub">Inspect where extracted fields came from and how confidently they were extracted.</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        trace_records = st.session_state.records
+        if trace_records:
+            trace_labels = []
+            for i, rec in enumerate(trace_records):
+                title = str(rec.get("Activity Title", "")).strip() or "Untitled Activity"
+                rid = str(rec.get("Record ID", "")).strip()
+                trace_labels.append(f"{rid} — {title}" if rid else title)
+
+            selected_trace = st.selectbox(
+                "Select an activity to inspect",
+                options=list(range(len(trace_records))),
+                format_func=lambda i: trace_labels[i],
+                key="traceability_selector",
+            )
+            selected = trace_records[selected_trace]
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**📄 Source**")
+                st.info(
+                    f"**Report:** {selected.get('Source Report', 'Not Identified')}\n\n"
+                    f"**Source page(s):** {selected.get('Source Page', 'Not Identified')}\n\n"
+                    f"**Activity summary page(s):** {selected.get('Activity Summary Pages', 'Not Identified')}"
+                )
+            with c2:
+                st.markdown("**🎯 Extraction quality**")
+                st.info(
+                    f"**Overall confidence:** {selected.get('Extraction Confidence', 'Not Identified')}\n\n"
+                    f"**Verification:** {selected.get('Verification Status', 'Needs Verification')}\n\n"
+                    f"**Missing information:** {selected.get('Missing Information', 'None identified')}"
+                )
+
+            fs = str(selected.get("Field Sources", "")).strip()
+            fc = str(selected.get("Field Confidence", "")).strip()
+
+            if fs and fs.lower() != "not identified":
+                source_rows = []
+                for part in fs.split(" | "):
+                    if ":" in part:
+                        field, page = part.split(":", 1)
+                        source_rows.append({"Field": field.strip(), "Source Page(s)": page.strip()})
+                    else:
+                        source_rows.append({"Field": part.strip(), "Source Page(s)": "Not Identified"})
+                st.dataframe(pd.DataFrame(source_rows), width="stretch", hide_index=True)
+            else:
+                st.warning("Field-level source pages were not identified for this activity.")
+
+            if fc and fc.lower() != "not identified":
+                confidence_rows = []
+                for part in fc.split(" | "):
+                    if ":" in part:
+                        field, score = part.split(":", 1)
+                        confidence_rows.append({"Field": field.strip(), "Confidence": score.strip()})
+                    else:
+                        confidence_rows.append({"Field": part.strip(), "Confidence": "Not Identified"})
+                st.dataframe(pd.DataFrame(confidence_rows), width="stretch", hide_index=True)
+            else:
+                st.warning("Field-level confidence was not identified for this activity.")
 
         st.markdown("""
         <div class="iqac-section">
