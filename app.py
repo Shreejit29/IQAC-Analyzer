@@ -13,6 +13,7 @@ from src.record_utils import (
     COLUMNS, EVIDENCE_FIELDS, NAAC_ATTRIBUTES, deduplicate_records,
     normalize_record, session_summary,
 )
+from src.validation_engine import validate_cross_document, validation_summary
 
 st.set_page_config(page_title="IQAC Analyzer", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
 
@@ -34,7 +35,7 @@ MAX_FILE_MB = int(setting("MAX_FILE_MB", "50"))
 
 
 for key, default in {
-    "records": [], "summaries": [], "analysis_done": False, "excel": None,
+    "records": [], "summaries": [], "analysis_done": False, "excel": None, "validation_issues": [],
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -87,7 +88,7 @@ with c2:
     clear = st.button("🧹 Clear Session", width='stretch')
 
 if clear:
-    for key in ["records", "summaries", "analysis_done", "excel", "editor_df"]:
+    for key in ["records", "summaries", "analysis_done", "excel", "validation_issues", "editor_df"]:
         st.session_state.pop(key, None)
     st.rerun()
 
@@ -122,22 +123,36 @@ if analyze:
         progress.progress(idx / len(uploads), text=f"Finished {idx} of {len(uploads)} report(s)")
 
     records, duplicate_count = deduplicate_records(records)
+
+    # Run conservative validation after extraction/deduplication. Validation never
+    # deletes records or invents facts; it only adds review flags and issue notes.
+    records, validation_issues = validate_cross_document(records)
+
     st.session_state.records = records
+    st.session_state.validation_issues = validation_issues
     st.session_state.summaries = summaries
     st.session_state.analysis_done = True
     st.session_state.excel = build_excel_bytes(records) if records else None
     if duplicate_count:
-        st.info(f"{duplicate_count} repeated extraction record(s) were suppressed within the same source report. Please still review the final rows.")
+        st.info(f"{duplicate_count} possible duplicate extraction record(s) were retained and flagged for review.")
+
+    vsummary = validation_summary(records, validation_issues)
+    if vsummary["records_with_issues"]:
+        st.warning(
+            f"Validation found {vsummary['records_with_issues']} record(s) with data-quality issues "
+            f"and {len(validation_issues)} cross-document issue(s). Review them before official use."
+        )
 
 if st.session_state.analysis_done:
     summary = session_summary(st.session_state.records)
     st.subheader("Analysis Summary")
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Reports", len(st.session_state.summaries))
     m2.metric("Activities Detected", summary["activities"])
     m3.metric("Needs Verification", summary["needs_verification"])
     m4.metric("Activities with Evidence Gaps", summary["evidence_gaps"])
     m5.metric("Possible Duplicates", summary["possible_duplicates"])
+    m6.metric("Validation Issues", len(st.session_state.get("validation_issues", [])))
 
     if st.session_state.summaries:
         st.dataframe(pd.DataFrame(st.session_state.summaries), width="stretch", hide_index=True)
@@ -275,10 +290,35 @@ if st.session_state.analysis_done:
                     refreshed.update(old_duplicate)
                     by_id[record_id] = refreshed
 
-                st.session_state.records = list(by_id.values())
+                reviewed_records = list(by_id.values())
+                reviewed_records, reviewed_issues = validate_cross_document(reviewed_records)
+                st.session_state.records = reviewed_records
+                st.session_state.validation_issues = reviewed_issues
                 st.session_state.excel = build_excel_bytes(st.session_state.records)
-                st.success("Review changes applied and quality fields recalculated.")
+                st.success("Review changes applied and validation recalculated.")
                 st.rerun()
+
+        st.subheader("🧪 Data Quality Validation")
+        validation_issues = st.session_state.get("validation_issues", [])
+        if validation_issues:
+            vs = validation_summary(st.session_state.records, validation_issues)
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("Records with Issues", vs["records_with_issues"])
+            q2.metric("High Severity", vs["high_severity_issues"])
+            q3.metric("Quantitative Issues", vs["quantitative_inconsistencies"])
+            q4.metric("Cross-document Issues", vs["cross_document_inconsistencies"])
+
+            st.caption(
+                "Validation is conservative: records are retained, factual conflicts are flagged, "
+                "and missing information is not replaced with guesses."
+            )
+            st.dataframe(
+                pd.DataFrame(validation_issues),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.success("No cross-document or quantitative inconsistencies were detected automatically.")
 
         st.subheader("📋 Evidence Review")
         evidence_columns = ["Record ID", "Activity Title", "Source Report"] + EVIDENCE_FIELDS + ["Evidence Gaps"]
