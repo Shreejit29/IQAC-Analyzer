@@ -12,6 +12,42 @@ from pydantic import BaseModel, Field
 from .record_utils import COLUMNS, NAAC_ATTRIBUTES, normalize_record
 
 
+NAAC_METRICS = {
+    "Curriculum Design": {"1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8"},
+    "Faculty Resources": {"2.1", "2.2", "2.3", "2.7"},
+    "Infrastructure": {"3.1", "3.2", "3.3", "3.4", "3.5", "3.6"},
+    "Financial Resources & Management": {"4.1 & 4.2", "4.3 & 4.4", "4.5", "4.6"},
+    "Learning & Teaching": {"5.1", "5.2", "5.3", "5.4", "5.5", "5.6", "5.7", "5.8"},
+    "Extended Curricular Engagements": {"6.1", "6.2", "6.3", "6.4", "6.5", "6.6"},
+    "Governance and Administration": {"7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10"},
+    "Student Outcomes": {"8.1", "8.2", "8.3", "8.4", "8.5", "8.6", "8.7", "8.8"},
+    "Research & Innovation Outcomes": {"9.1", "9.2", "9.3", "9.4", "9.5", "9.6", "9.7", "9.8", "9.9"},
+    "Sustainability Outcomes (Including Green Initiatives)": {"10.1", "10.2", "10.3", "10.4", "10.5"},
+}
+
+
+RECOVERY_PROMPT = r"""
+ACTIVITY RECOVERY PASS
+The first analysis returned zero activities. Re-read the COMPLETE uploaded document and determine whether it contains
+one or more genuine institutional activities/events. Look especially for an Activity Sheet, Basic Summary, event title,
+date, venue, department/committee, objectives, participants, event report, attendance, photographs or feedback.
+
+Important: supporting pages such as attendance sheets, notices, photographs and feedback usually belong to an already
+identified activity. Do NOT create separate activities for those supporting pages.
+
+If there is a genuine activity, return it as an Activity object even if some fields are Not Identified. If the document
+is only a standalone notice, attendance sheet, certificate, feedback form or unrelated administrative document with no
+identifiable event, return zero activities.
+"""
+
+
+NAAC_METRIC_TEXT = r"""
+NAAC METRIC VALIDATION
+The metric must be one of the exact metric codes in the supplied catalog. Keep the attribute and metric logically
+consistent. Do not output a metric from a different attribute. If the report does not support a mapping, use
+Not Identified. Never invent an official NAAC score."""
+
+
 class GeminiError(RuntimeError):
     pass
 
@@ -105,7 +141,11 @@ CORE RULES
     separate event.
 14. Do not create duplicate activities from repeated headers, feedback pages, photos or evidence pages.
 15. NAAC/Binary mapping is a reference classification only. Do not claim an official NAAC score or accreditation result.
-16. The output is for human verification. Be conservative when evidence is ambiguous.
+16. Return at least one activity whenever the document clearly contains an institutional event/activity, even if some fields are missing.
+17. Do not return zero activities merely because the report contains scanned images, handwriting or supporting evidence pages.
+18. For a single event with many supporting pages, return exactly one activity unless the report clearly documents multiple distinct events.
+19. Use the exact NAAC metric code from the supplied catalog; never write a metric name without its code.
+20. The output is for human verification. Be conservative when evidence is ambiguous.
 
 REAL REPORT PATTERN TO RECOGNIZE
 A typical RTCCS activity report may have:
@@ -276,8 +316,9 @@ def _upload_and_analyze(
     filename: str,
     model: str,
     api_key: str,
-    max_retries: int = 4,
+    max_retries: int = 3,
 ) -> ReportAnalysis:
+    # Prefer the configured model, then use the stable lightweight fallback.
     models_to_try = [model]
     if model != "gemini-3.5-flash-lite":
         models_to_try.append("gemini-3.5-flash-lite")
@@ -286,7 +327,15 @@ def _upload_and_analyze(
     for selected_model in models_to_try:
         for attempt in range(1, max_retries + 1):
             try:
-                return _upload_and_analyze_once(raw, filename, selected_model, api_key)
+                result = _upload_and_analyze_once(raw, filename, selected_model, api_key)
+                # Empty activity output is treated as a recoverable extraction problem rather than a successful
+                # analysis. A targeted second pass prevents scanned/structured reports from being silently lost.
+                if not result.activities:
+                    result = _recover_activities(raw, filename, selected_model, api_key)
+                if result.activities:
+                    return result
+                # A genuinely activity-free document is valid; return it so the UI can report zero activities.
+                return result
             except Exception as exc:
                 last_error = exc
                 if not _is_transient_gemini_error(exc):
@@ -300,6 +349,62 @@ def _upload_and_analyze(
         f"Gemini is temporarily unavailable for {filename}. "
         f"Please retry after a short wait. Last error: {last_error}"
     ) from last_error
+
+
+def _recover_activities(raw: bytes, filename: str, model: str, api_key: str) -> ReportAnalysis:
+    """Run a targeted second extraction pass only when the first pass found no activities."""
+    client = _client(api_key)
+    suffix = Path(filename).suffix.lower()
+    temp_path: str | None = None
+    remote_file = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(raw)
+            temp_path = tmp.name
+        try:
+            remote_file = client.files.upload(
+                file=temp_path,
+                config={"mime_type": _mime_for(filename)},
+            )
+        except TypeError:
+            remote_file = client.files.upload(file=temp_path)
+
+        prompt = SYSTEM_PROMPT + "\n\n" + RECOVERY_PROMPT + "\n\n" + NAAC_METRIC_TEXT
+        prompt += f"\n\nSOURCE FILE NAME: {filename}\nReturn the structured report after this recovery pass."
+        response = client.models.generate_content(
+            model=model,
+            contents=[remote_file, prompt],
+            config={
+                "temperature": 0.0,
+                "response_mime_type": "application/json",
+                "response_schema": ReportAnalysis,
+            },
+        )
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, ReportAnalysis):
+            return parsed
+        raw_text = getattr(response, "text", "") or ""
+        if not raw_text:
+            raise GeminiError("Gemini recovery pass returned an empty response.")
+        try:
+            return ReportAnalysis.model_validate_json(raw_text)
+        except Exception as exc:
+            raise GeminiError(f"Gemini recovery pass returned invalid structured data: {exc}") from exc
+    except GeminiError:
+        raise
+    except Exception as exc:
+        raise GeminiError(f"Gemini activity-recovery pass failed for {filename}: {exc}") from exc
+    finally:
+        if remote_file is not None:
+            try:
+                client.files.delete(name=remote_file.name)
+            except Exception:
+                pass
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 def _upload_and_analyze_once(raw: bytes, filename: str, model: str, api_key: str) -> ReportAnalysis:
@@ -441,14 +546,26 @@ def _map_activity(a: Activity, source_file: str, index: int, report_year: str) -
         "Missing Information": a.missing_information,
         "Evidence Gaps": a.evidence_gaps,
     }
-    if mapped["NAAC Attribute"] == "Not Identified" or mapped["NAAC Metric"] == "Not Identified":
+    # Validate Gemini's mapping against the exact supplied catalog. If Gemini misses either field or produces an
+    # inconsistent attribute/metric pair, use the deterministic activity classifier as a safety net.
+    attr = str(mapped.get("NAAC Attribute", "Not Identified")).strip()
+    metric = str(mapped.get("NAAC Metric", "Not Identified")).strip()
+    valid_pair = attr in NAAC_METRICS and metric in NAAC_METRICS.get(attr, set())
+
+    if not valid_pair:
         fallback_attr, fallback_metric = _keyword_naac_fallback(a)
         if fallback_attr != "Not Identified":
-            mapped["NAAC Attribute"] = fallback_attr
-            mapped["NAAC Metric"] = fallback_metric
+            attr, metric = fallback_attr, fallback_metric
+        else:
+            # Preserve a valid attribute if Gemini supplied one, but never preserve a metric that belongs to
+            # another attribute. This prevents contradictory NAAC mappings from reaching the master sheet.
+            if attr not in NAAC_METRICS:
+                attr = "Not Identified"
+            if metric not in NAAC_METRICS.get(attr, set()):
+                metric = "Not Identified"
 
-    if mapped["NAAC Attribute"] not in NAAC_ATTRIBUTES:
-        mapped["NAAC Attribute"] = "Not Identified"
+    mapped["NAAC Attribute"] = attr if attr in NAAC_ATTRIBUTES else "Not Identified"
+    mapped["NAAC Metric"] = metric if metric in NAAC_METRICS.get(mapped["NAAC Attribute"], set()) else "Not Identified"
     return normalize_record(mapped, source_file, index, a.source_page or "Not Identified")
 
 
