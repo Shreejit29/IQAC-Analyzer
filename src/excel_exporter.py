@@ -398,6 +398,161 @@ def build_excel_bytes(records):
     dq.freeze_panes = "A4"
     _autofit(dq, 12, 48)
 
+    # ---------- Field Traceability ----------
+    ft = wb.create_sheet("Field Traceability")
+    ft_cols = [
+        "Record ID", "Activity Title", "Field", "Extracted Value",
+        "Source Page", "Field Confidence", "Verification Status", "Source Report"
+    ]
+    _style_title(
+        ft,
+        "Field Traceability",
+        "Field-level source pages and extraction confidence",
+        len(ft_cols),
+    )
+    for i, c in enumerate(ft_cols, 1):
+        ft.cell(3, i, c)
+    _style_header(ft[3])
+
+    for r in records:
+        field_sources = r.get("Field Sources") or r.get("field_sources") or {}
+        field_conf = r.get("Field Confidence") or r.get("field_confidence") or {}
+
+        # Support either dictionaries or JSON-like strings where practical.
+        if isinstance(field_sources, str):
+            try:
+                import json
+                field_sources = json.loads(field_sources)
+            except Exception:
+                field_sources = {}
+        if isinstance(field_conf, str):
+            try:
+                import json
+                field_conf = json.loads(field_conf)
+            except Exception:
+                field_conf = {}
+
+        if isinstance(field_sources, dict):
+            fields = list(field_sources.keys())
+        elif isinstance(field_conf, dict):
+            fields = list(field_conf.keys())
+        else:
+            fields = []
+
+        # If the AI did not return field-level metadata, retain a useful
+        # record-level traceability row rather than inventing page numbers.
+        if not fields:
+            fields = ["Record-level extraction"]
+
+        for field in fields:
+            value = r.get(field, "")
+            if value == "":
+                # Try common normalized/case-insensitive field names.
+                normalized = str(field).strip().lower().replace("_", " ")
+                for key, candidate in r.items():
+                    if str(key).strip().lower().replace("_", " ") == normalized:
+                        value = candidate
+                        break
+
+            page = field_sources.get(field, "") if isinstance(field_sources, dict) else ""
+            conf = field_conf.get(field, "") if isinstance(field_conf, dict) else ""
+            n = _confidence(conf)
+
+            ft.append([
+                _s(r.get("Record ID")),
+                _s(r.get("Activity Title")),
+                _s(field),
+                _s(value),
+                _s(page),
+                n,
+                _s(r.get("Verification Status")),
+                _s(r.get("Source Report")),
+            ])
+
+    if ft.max_row >= 4:
+        _style_body(ft, 4, ft.max_row)
+        for row in ft.iter_rows(min_row=4, max_row=ft.max_row):
+            row[5].number_format = "0%"
+        _add_table(ft, f"A3:H{ft.max_row}", "FieldTraceability")
+        ft.conditional_formatting.add(
+            f"F4:F{ft.max_row}",
+            CellIsRule(
+                operator="lessThan",
+                formula=["0.70"],
+                fill=PatternFill("solid", fgColor=RED),
+            ),
+        )
+    ft.freeze_panes = "A4"
+    _autofit(ft, 12, 48)
+
+    # ---------- Field Confidence Summary ----------
+    fc = wb.create_sheet("Field Confidence")
+    fc_cols = ["Record ID", "Activity Title", "Field", "Confidence", "Source Page", "Review Status"]
+    _style_title(
+        fc,
+        "Field Confidence",
+        "Field-level extraction confidence for review prioritization",
+        len(fc_cols),
+    )
+    for i, c in enumerate(fc_cols, 1):
+        fc.cell(3, i, c)
+    _style_header(fc[3])
+
+    for r in records:
+        field_conf = r.get("Field Confidence") or r.get("field_confidence") or {}
+        field_sources = r.get("Field Sources") or r.get("field_sources") or {}
+
+        if isinstance(field_conf, str):
+            try:
+                import json
+                field_conf = json.loads(field_conf)
+            except Exception:
+                field_conf = {}
+        if isinstance(field_sources, str):
+            try:
+                import json
+                field_sources = json.loads(field_sources)
+            except Exception:
+                field_sources = {}
+
+        if isinstance(field_conf, dict) and field_conf:
+            for field, conf in field_conf.items():
+                n = _confidence(conf)
+                page = field_sources.get(field, "") if isinstance(field_sources, dict) else ""
+                status = "Review" if n is not None and n < 0.70 else "OK"
+                fc.append([
+                    _s(r.get("Record ID")),
+                    _s(r.get("Activity Title")),
+                    _s(field),
+                    n,
+                    _s(page),
+                    status,
+                ])
+
+    if fc.max_row >= 4:
+        _style_body(fc, 4, fc.max_row)
+        for row in fc.iter_rows(min_row=4, max_row=fc.max_row):
+            row[3].number_format = "0%"
+        _add_table(fc, f"A3:F{fc.max_row}", "FieldConfidence")
+        fc.conditional_formatting.add(
+            f"D4:D{fc.max_row}",
+            CellIsRule(
+                operator="lessThan",
+                formula=["0.70"],
+                fill=PatternFill("solid", fgColor=RED),
+            ),
+        )
+        fc.conditional_formatting.add(
+            f"D4:D{fc.max_row}",
+            CellIsRule(
+                operator="greaterThanOrEqual",
+                formula=["0.90"],
+                fill=PatternFill("solid", fgColor=GREEN),
+            ),
+        )
+    fc.freeze_panes = "A4"
+    _autofit(fc, 12, 44)
+
     # ---------- Read Me ----------
     rm = wb.create_sheet("Read Me", 0)
     _style_title(rm, "IQAC Analyzer — Workbook Guide",
