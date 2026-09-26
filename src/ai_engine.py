@@ -90,11 +90,27 @@ Use the following reference catalog exactly:
 If the activity does not provide enough evidence for a defensible mapping, use "Not Identified".
 This is an internal reference mapping, not an official accreditation decision.
 
-DOCUMENT STATUS
-For each of these document types, report Present only when the uploaded report actually contains or clearly identifies that evidence; otherwise report Absent.
+DOCUMENT STATUS — MANDATORY CHECKLIST
+You MUST return exactly one EvidenceItem for EVERY document type listed below, in the same order. Never return an empty evidence list and never omit a document type.
 Document types: {', '.join(DOCUMENT_TYPES)}
-For Present, include a source page when identifiable. For Absent, do not guess a page.
+For each document type, status MUST be exactly one of: Present, Absent, Not Identified.
+Use Present only when the uploaded report actually contains or clearly identifies that evidence. Use Absent when the report was checked and that evidence is not present. Use Not Identified only when the report is unreadable/ambiguous and you genuinely cannot determine the status.
+For Present, include a source page when identifiable. For Absent or Not Identified, use source_page = "Not Identified".
 Do not infer that a document exists just because the activity itself exists.
+Even when there is no supporting evidence, still return all 14 checklist items with their status.
+
+NAAC MAPPING — MANDATORY
+For every activity, you MUST provide one best-fit NAAC Attribute and one best-fit NAAC Metric whenever the activity type/content provides enough information. Do not leave these fields blank. Use "Not Identified" only when the activity itself genuinely provides insufficient information for a defensible mapping.
+Useful internal examples (apply only when supported by the activity):
+- Technical/domain-oriented student activities, competitions, technical events and similar extension activities → Attribute 6, Extended Curricular Engagements; Metric 6.1, when the activity clearly fits this category.
+- Cultural activities → 6.2 when clearly supported.
+- Student wellbeing/health activities → 6.3 when clearly supported.
+- Value education/ethics → 6.4 when clearly supported.
+- Sports activities → 6.5 when clearly supported.
+- Community service/NSS/UBA activities → 6.6 when clearly supported.
+- IQAC/quality assurance activities → 7.6 when clearly supported.
+- Explicit environmental/green initiatives such as tree plantation → Attribute 10, Sustainability Outcomes (Including Green Initiatives); Metric 10.4, when clearly supported.
+These are internal reference mappings, not official accreditation decisions.
 """.strip()
 
 RECOVERY_PROMPT = """
@@ -255,15 +271,20 @@ def _recover(raw: bytes, filename: str, model: str, api_key: str) -> ReportAnaly
 
 
 def _map_activity(activity: Activity, source_report: str, index: int, report_year: str) -> dict[str, str]:
+    # Gemini is instructed to return all 14 evidence types. This defensive
+    # normalization also handles older/partial responses without breaking the UI.
     evidence_by_type = {item.document.strip().lower(): item for item in activity.evidence if item.document.strip()}
     present: list[str] = []
     absent: list[str] = []
     for doc_name in DOCUMENT_TYPES:
         item = evidence_by_type.get(doc_name.lower())
-        if item and item.status.strip().lower() == "present":
+        status = item.status.strip().lower() if item else "absent"
+        if status == "present":
             page = item.source_page if item.source_page != "Not Identified" else "Not Identified"
             present.append(f"{doc_name} (p. {page})" if page != "Not Identified" else doc_name)
         else:
+            # Missing checklist entries from an older/partial Gemini response are
+            # safely displayed as Absent rather than making the whole checklist NI.
             absent.append(doc_name)
 
     raw = {
