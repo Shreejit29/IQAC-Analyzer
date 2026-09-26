@@ -103,6 +103,12 @@ class Activity(BaseModel):
     missing_information: str = "Not Identified"
     evidence_gaps: str = "Not Identified"
     extraction_notes: str = "Not Identified"
+    # Field-level traceability. Keys should match the canonical field names below.
+    # Values are compact source-page references such as "1", "1-2", or "6-8".
+    field_sources: dict[str, str] = Field(default_factory=dict)
+    # Field-level confidence as percentages or decimal strings. These are evidence-based extraction estimates,
+    # not probabilities of factual truth.
+    field_confidence: dict[str, str] = Field(default_factory=dict)
 
 
 class ReportAnalysis(BaseModel):
@@ -136,12 +142,20 @@ CORE RULES
 10. Preserve institutional wording, activity titles, department names, committee names, dates and venue names.
 11. For page traceability, use the PDF page number(s) where the activity is summarized and where supporting evidence
     appears. If several pages belong to the activity, use a compact range/list such as "1-14" or "3, 7-14".
-12. If the document is image-based, read the page images visually. Handwritten attendance and feedback count as evidence.
-13. Do not treat a newspaper clipping, photo or feedback form as a separate activity unless it clearly describes a
+12. For every important extracted field, provide a field_sources entry using the canonical field name and the page(s)
+    that directly support that value. Use "Not Identified" when the value is not supported. Do not invent page numbers.
+13. For every important extracted field, provide field_confidence as an extraction-evidence estimate from 0-100.
+    Use high confidence only when the value is clearly readable and directly supported; use lower confidence for
+    partial/uncertain OCR or indirect evidence. For a missing field use 0 or "Not Identified".
+14. If multiple pages support a field, list them compactly, e.g. "1-2" or "6-8". If the field is supported by the
+    activity summary page and later evidence, list both, e.g. "2, 9-10".
+15. Field confidence is NOT factual certainty and must not be presented as an official probability.
+16. If the document is image-based, read the page images visually. Handwritten attendance and feedback count as evidence.
+17. Do not treat a newspaper clipping, photo or feedback form as a separate activity unless it clearly describes a
     separate event.
-14. Do not create duplicate activities from repeated headers, feedback pages, photos or evidence pages.
-15. NAAC/Binary mapping is a reference classification only. Do not claim an official NAAC score or accreditation result.
-16. Return at least one activity whenever the document clearly contains an institutional event/activity, even if some fields are missing.
+18. Do not create duplicate activities from repeated headers, feedback pages, photos or evidence pages.
+19. NAAC/Binary mapping is a reference classification only. Do not claim an official NAAC score or accreditation result.
+20. Return at least one activity whenever the document clearly contains an institutional event/activity, even if some fields are missing.
 17. Do not return zero activities merely because the report contains scanned images, handwriting or supporting evidence pages.
 18. For a single event with many supporting pages, return exactly one activity unless the report clearly documents multiple distinct events.
 19. Use the exact NAAC metric code from the supplied catalog; never write a metric name without its code.
@@ -496,6 +510,77 @@ def _keyword_naac_fallback(a: Activity) -> tuple[str, str]:
     return "Not Identified", "Not Identified"
 
 
+_CANONICAL_FIELD_ALIASES = {
+    "academic_year": "Academic Year",
+    "activity_date": "Activity Date",
+    "activity_title": "Activity Title",
+    "activity_type": "Activity Type",
+    "category": "Category",
+    "organizing_department": "Organizing Department",
+    "organizing_committee": "Organizing Committee",
+    "collaborating_agency": "Collaborating Agency",
+    "resource_person": "Resource Person",
+    "resource_person_affiliation": "Resource Person Affiliation",
+    "venue": "Venue",
+    "duration": "Duration",
+    "target_group": "Target Group",
+    "total_participants": "Total Participants",
+    "student_participants": "Student Participants",
+    "faculty_participants": "Faculty Participants",
+    "external_participants": "External Participants",
+    "objective": "Objective",
+    "activity_description": "Activity Description",
+    "outcome": "Outcome",
+    "impact": "Impact",
+    "follow_up_action": "Follow-up Action",
+    "feedback": "Feedback",
+    "evidence_available": "Evidence Available",
+    "evidence_link": "Evidence Link",
+    "naac_attribute": "NAAC Attribute",
+    "naac_metric": "NAAC Metric",
+    "quantitative_data": "Quantitative Data",
+    "source_page": "Source Page",
+    "activity_summary_pages": "Activity Summary Pages",
+    "missing_information": "Missing Information",
+    "evidence_gaps": "Evidence Gaps",
+}
+
+
+def _compact_field_sources(values: dict[str, str] | None) -> str:
+    """Serialize page traceability compactly for Excel/UI while preserving field names."""
+    if not values:
+        return "Not Identified"
+    parts = []
+    for key, value in values.items():
+        if value is None:
+            continue
+        field = _CANONICAL_FIELD_ALIASES.get(str(key), str(key))
+        page = str(value).strip()
+        if not page:
+            continue
+        parts.append(f"{field}: {page}")
+    return " | ".join(parts) if parts else "Not Identified"
+
+
+def _normalize_field_confidence(values: dict[str, str] | None, a: Activity) -> str:
+    """Normalize field confidence into a compact 'Field: xx%' string."""
+    values = values or {}
+    parts = []
+    for key, value in values.items():
+        field = _CANONICAL_FIELD_ALIASES.get(str(key), str(key))
+        try:
+            raw = str(value).strip().replace("%", "")
+            score = float(raw)
+            if score <= 1:
+                score *= 100
+            score = max(0, min(100, score))
+            parts.append(f"{field}: {score:.0f}%")
+        except Exception:
+            if str(value).strip():
+                parts.append(f"{field}: {value}")
+    return " | ".join(parts) if parts else "Not Identified"
+
+
 def _map_activity(a: Activity, source_file: str, index: int, report_year: str) -> dict[str, str]:
     e = a.evidence
     mapped: dict[str, Any] = {
@@ -545,6 +630,8 @@ def _map_activity(a: Activity, source_file: str, index: int, report_year: str) -
         "Activity Summary Pages": a.activity_summary_pages,
         "Missing Information": a.missing_information,
         "Evidence Gaps": a.evidence_gaps,
+        "Field Sources": _compact_field_sources(a.field_sources),
+        "Field Confidence": _normalize_field_confidence(a.field_confidence, a),
     }
     # Validate Gemini's mapping against the exact supplied catalog. If Gemini misses either field or produces an
     # inconsistent attribute/metric pair, use the deterministic activity classifier as a safety net.
