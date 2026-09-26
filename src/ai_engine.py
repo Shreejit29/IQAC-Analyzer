@@ -479,8 +479,23 @@ def _upload_and_analyze(
 
 
 def _recover_activities(raw: bytes, filename: str, model: str, api_key: str) -> ReportAnalysis:
-    """Run a targeted second extraction pass only when the first pass found no activities."""
+    """Run a targeted second extraction pass only when the first pass found no activities.
+
+    Upgrade 12 keeps recovery on the local-text fast path whenever possible, so a
+    zero-activity result does not automatically trigger a second PDF upload.
+    """
     client = _client(api_key)
+    extracted_text, usable_text, extraction_method = _extract_local_text(raw, filename)
+
+    # SMART RECOVERY: text-readable files stay local.
+    if usable_text:
+        if len(extracted_text) > 180_000:
+            extracted_text = extracted_text[:180_000] + "\n--- END OF LOCALLY EXTRACTED TEXT (TRUNCATED) ---"
+        prompt = SYSTEM_PROMPT + "\n\n" + RECOVERY_PROMPT + "\n\n" + NAAC_METRIC_TEXT
+        prompt += f"\n\nSOURCE FILE NAME: {filename}\nLOCAL EXTRACTION MODE: {extraction_method}"
+        prompt += "\n\nUse the page-labelled local text below for targeted recovery.\n"
+        return _generate_structured(client, model, [prompt, extracted_text])
+
     suffix = Path(filename).suffix.lower()
     temp_path: str | None = None
     remote_file = None
@@ -753,33 +768,51 @@ EVIDENCE_CATEGORIES = [
 
 
 def _evidence_trace_parts(a: Activity) -> list[dict[str, str]]:
+    """Normalize Gemini evidence output against the complete canonical evidence list.
+
+    Missing categories are explicitly represented as Not Identified, preventing the
+    evidence dashboard from looking complete merely because Gemini omitted categories.
+    """
     aliases = {
         "program": "Programme/Schedule", "programme": "Programme/Schedule",
         "schedule": "Programme/Schedule", "program schedule": "Programme/Schedule",
+        "programme table": "Programme/Schedule",
         "photo": "Photographs", "photos": "Photographs", "photograph": "Photographs",
         "geotagged photo": "Geotagged Photographs", "geotagged photos": "Geotagged Photographs",
+        "feedback analysis": "Feedback Analysis",
         "news": "News/Publicity", "publicity": "News/Publicity",
         "certificate": "Certificate", "certificates": "Certificate",
+        "other": "Other Evidence",
     }
-    result, seen = [], set()
+    supplied: dict[str, dict[str, str]] = {}
     for item in (a.evidence_trace or []):
-        category = str(item.evidence_type or "").strip()
-        if not category:
+        raw_category = str(item.evidence_type or "").strip()
+        if not raw_category:
             continue
-        category = aliases.get(category.lower().replace("_"," ").replace("-"," "), category)
-        if category.lower() in seen:
-            continue
-        seen.add(category.lower())
+        key = raw_category.lower().replace("_", " ").replace("-", " ").strip()
+        category = aliases.get(key, raw_category)
+        # Match canonical categories case-insensitively.
+        canonical = next((c for c in EVIDENCE_CATEGORIES if c.lower() == category.lower()), category)
         raw = str(item.status or "Not Identified").strip().lower()
-        status = "Present" if raw in {"present","available","found","yes"} else (
-            "Not Applicable" if raw in {"na","n/a","not applicable"} else "Not Identified"
+        status = "Present" if raw in {"present", "available", "found", "yes"} else (
+            "Not Applicable" if raw in {"na", "n/a", "not applicable"} else "Not Identified"
         )
-        result.append({
-            "Evidence Type": category,
+        supplied[canonical] = {
+            "Evidence Type": canonical,
             "Status": status,
             "Source Page": str(item.source_page or "Not Identified").strip(),
             "Notes": str(item.notes or "").strip(),
-        })
+        }
+
+    # Always emit the full controlled vocabulary in stable order.
+    result = []
+    for category in EVIDENCE_CATEGORIES:
+        result.append(supplied.get(category, {
+            "Evidence Type": category,
+            "Status": "Not Identified",
+            "Source Page": "Not Identified",
+            "Notes": "Category not explicitly identified in the extracted document evidence.",
+        }))
     return result
 
 
