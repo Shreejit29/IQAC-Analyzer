@@ -1,53 +1,130 @@
+"""
+IQAC Analyzer - Professional Excel Exporter
+
+Builds a multi-sheet, presentation-ready IQAC workbook while preserving
+the public API: build_excel_bytes(records) -> bytes.
+"""
+
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime
 from io import BytesIO
-from typing import Any
+from typing import Any, Dict, Iterable, List
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.worksheet.datavalidation import DataValidation
-
-from .record_utils import COLUMNS, EVIDENCE_FIELDS
 
 
-HEADER_FILL = PatternFill("solid", fgColor="0F766E")
-SUBHEADER_FILL = PatternFill("solid", fgColor="D9EDEB")
-WARNING_FILL = PatternFill("solid", fgColor="FFF2CC")
-ERROR_FILL = PatternFill("solid", fgColor="FCE4D6")
-SUCCESS_FILL = PatternFill("solid", fgColor="E2F0D9")
-WHITE_FONT = Font(bold=True, color="FFFFFF")
-BOLD_FONT = Font(bold=True)
+MASTER_COLUMNS = [
+    "Record ID", "Academic Year", "Activity Date", "Activity Title",
+    "Activity Type", "Category", "Organizing Department",
+    "Organizing Committee", "Collaborating Agency", "Resource Person",
+    "Resource Person Affiliation", "Venue", "Duration", "Target Group",
+    "Total Participants", "Student Participants", "Faculty Participants",
+    "External Participants", "Objective", "Activity Description",
+    "Outcome", "Impact", "Follow-up Action", "Feedback",
+    "Evidence Available", "Evidence Link", "NAAC Attribute", "NAAC Metric",
+    "Quantitative Data", "Source Report", "Source Page",
+    "Missing Information", "Extraction Status", "Verification Status",
+    "Extraction Confidence",
+]
+
+DARK = "17365D"
+MID = "2F75B5"
+LIGHT = "D9EAF7"
+PALE = "EEF5FB"
+WHITE = "FFFFFF"
+GREEN = "E2F0D9"
+YELLOW = "FFF2CC"
+RED = "FCE4D6"
+GREY = "E7E6E6"
+TEXT = "1F2937"
+BORDER = "B7C9D6"
+
+thin = Side(style="thin", color=BORDER)
 
 
-def _text(value: Any) -> str:
+def _s(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
 
 
-def _missing(value: Any) -> bool:
-    v = _text(value).lower()
-    return v in {"", "not identified", "not mentioned", "unknown", "n/a", "na", "none", "unclear"}
+def _confidence(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        n = float(value)
+        if n > 1:
+            n /= 100.0
+        return max(0.0, min(1.0, n))
+    except Exception:
+        return None
 
 
-def _style_header(ws, row: int = 1) -> None:
-    for cell in ws[row]:
-        cell.fill = HEADER_FILL
-        cell.font = WHITE_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[row].height = 38
+def _records(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [dict(r or {}) for r in records]
 
 
-def _add_table(ws, name: str, min_row: int = 1) -> None:
-    if ws.max_row < min_row + 1 or ws.max_column < 1:
+def _style_title(ws, title, subtitle=None, end_col=8):
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_col)
+    c = ws.cell(1, 1, title)
+    c.font = Font(name="Aptos Display", size=20, bold=True, color=WHITE)
+    c.fill = PatternFill("solid", fgColor=DARK)
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 34
+    if subtitle:
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=end_col)
+        c = ws.cell(2, 1, subtitle)
+        c.font = Font(name="Aptos", size=10, italic=True, color="52606D")
+        c.fill = PatternFill("solid", fgColor=PALE)
+        c.alignment = Alignment(vertical="center")
+        ws.row_dimensions[2].height = 22
+
+
+def _style_header(row):
+    for c in row:
+        c.font = Font(name="Aptos", size=10, bold=True, color=WHITE)
+        c.fill = PatternFill("solid", fgColor=MID)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = Border(bottom=thin)
+    row[0].parent.row_dimensions[row[0].row].height = 30
+
+
+def _style_body(ws, start_row, end_row, start_col=1, end_col=None):
+    if end_col is None:
+        end_col = ws.max_column
+    for row in ws.iter_rows(min_row=start_row, max_row=end_row,
+                            min_col=start_col, max_col=end_col):
+        for c in row:
+            c.font = Font(name="Aptos", size=10, color=TEXT)
+            c.alignment = Alignment(vertical="top", wrap_text=True)
+            c.border = Border(bottom=thin)
+        if row[0].row % 2 == 0:
+            for c in row:
+                c.fill = PatternFill("solid", fgColor="F7FAFC")
+
+
+def _autofit(ws, min_width=10, max_width=42):
+    for col in range(1, ws.max_column + 1):
+        letter = get_column_letter(col)
+        max_len = 0
+        for cell in ws[letter]:
+            value = "" if cell.value is None else str(cell.value)
+            max_len = max(max_len, max((len(x) for x in value.splitlines()), default=0))
+        ws.column_dimensions[letter].width = max(min_width, min(max_width, max_len + 2))
+
+
+def _add_table(ws, ref, name):
+    if ws.max_row < 2:
         return
-    ref = f"A{min_row}:{get_column_letter(ws.max_column)}{ws.max_row}"
     table = Table(displayName=name, ref=ref)
     table.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium4",
+        name="TableStyleMedium2",
         showFirstColumn=False,
         showLastColumn=False,
         showRowStripes=True,
@@ -56,303 +133,306 @@ def _add_table(ws, name: str, min_row: int = 1) -> None:
     ws.add_table(table)
 
 
-def _format_sheet(ws, widths: dict[str, float] | None = None, freeze: str = "A2") -> None:
-    ws.freeze_panes = freeze
-    ws.sheet_view.showGridLines = False
-    for row in ws.iter_rows():
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-    if widths:
-        for col, width in widths.items():
-            ws.column_dimensions[col].width = width
+def _issue_rows(records):
+    rows = []
+    for r in records:
+        missing = _s(r.get("Missing Information"))
+        status = _s(r.get("Verification Status"))
+        conf = _confidence(r.get("Extraction Confidence"))
+        issues = []
+        if missing and missing.lower() not in {"none", "not identified", "n/a"}:
+            issues.append("Missing information")
+        if "duplicate" in status.lower():
+            issues.append("Possible duplicate")
+        if conf is not None and conf < 0.70:
+            issues.append("Low extraction confidence")
+        if _s(r.get("NAAC Attribute")).lower() in {"", "not identified"}:
+            issues.append("NAAC attribute not identified")
+        if _s(r.get("NAAC Metric")).lower() in {"", "not identified"}:
+            issues.append("NAAC metric not identified")
+        if issues:
+            rows.append([
+                _s(r.get("Record ID")),
+                _s(r.get("Activity Title")),
+                "; ".join(issues),
+                missing,
+                status,
+                _s(r.get("Source Report")),
+                _s(r.get("Source Page")),
+                _s(r.get("Recommended Action")) or "Review record",
+            ])
+    return rows
 
 
-def _safe_table_name(value: str) -> str:
-    cleaned = "".join(ch for ch in value if ch.isalnum())
-    return cleaned[:200] or "IQACTable"
+def build_excel_bytes(records):
+    records = _records(records)
 
+    wb = Workbook()
+    dashboard = wb.active
+    dashboard.title = "IQAC Dashboard"
 
-def _build_master_sheet(wb: Workbook, records: list[dict[str, Any]]) -> None:
-    ws = wb.active
-    ws.title = "IQAC_Master_Data"
-
-    ws.append(COLUMNS)
-    for rec in records:
-        ws.append([_text(rec.get(c)) or "Not Identified" for c in COLUMNS])
-
-    _style_header(ws)
-    _format_sheet(ws, freeze="A2")
-
-    # Make important review fields visually obvious.
-    try:
-        status_col = COLUMNS.index("Verification Status") + 1
-        confidence_col = COLUMNS.index("Extraction Confidence") + 1
-        missing_col = COLUMNS.index("Missing Information") + 1
-        gap_col = COLUMNS.index("Evidence Gaps") + 1
-
-        for row in range(2, ws.max_row + 1):
-            status = _text(ws.cell(row, status_col).value).lower()
-            confidence = _text(ws.cell(row, confidence_col).value).lower()
-            if "possible duplicate" in status:
-                ws.cell(row, status_col).fill = ERROR_FILL
-            elif "verified" == status:
-                ws.cell(row, status_col).fill = SUCCESS_FILL
-            elif "needs verification" in status:
-                ws.cell(row, status_col).fill = WARNING_FILL
-            if "low" in confidence:
-                ws.cell(row, confidence_col).fill = ERROR_FILL
-            elif "medium" in confidence:
-                ws.cell(row, confidence_col).fill = WARNING_FILL
-            if _text(ws.cell(row, missing_col).value) not in {"", "None identified"}:
-                ws.cell(row, missing_col).fill = WARNING_FILL
-            if _text(ws.cell(row, gap_col).value) not in {"", "None identified"}:
-                ws.cell(row, gap_col).fill = WARNING_FILL
-    except ValueError:
-        pass
-
-    # Useful starting widths; remaining columns get a safe default.
-    for i, column in enumerate(COLUMNS, 1):
-        width = 22
-        if column == "Record ID":
-            width = 20
-        elif column == "Activity Title":
-            width = 36
-        elif column in {"Objective", "Activity Description", "Outcome", "Impact", "Follow-up Action", "Feedback", "Missing Information", "Evidence Gaps"}:
-            width = 42
-        elif column in {"Source Report", "Evidence Link"}:
-            width = 34
-        elif column in {"NAAC Attribute", "NAAC Metric"}:
-            width = 34
-        ws.column_dimensions[get_column_letter(i)].width = width
-
-    if records:
-        _add_table(ws, "IQACMasterData")
-
-
-def _build_verification_sheet(wb: Workbook, records: list[dict[str, Any]]) -> None:
-    ws = wb.create_sheet("Verification_Queue")
-    fields = [
-        "Record ID", "Activity Date", "Activity Title", "Activity Type",
-        "Organizing Department", "Organizing Committee", "NAAC Attribute", "NAAC Metric",
-        "Missing Information", "Evidence Gaps", "Verification Status", "Extraction Confidence",
-        "Source Report", "Source Page",
-    ]
-    ws.append(fields)
-
-    for rec in records:
-        status = _text(rec.get("Verification Status"))
-        missing = _text(rec.get("Missing Information"))
-        gaps = _text(rec.get("Evidence Gaps"))
-        confidence = _text(rec.get("Extraction Confidence"))
-        needs_review = (
-            status.lower() != "verified"
-            or (missing and missing != "None identified")
-            or (gaps and gaps != "None identified")
-            or "low" in confidence.lower()
-            or "medium" in confidence.lower()
-        )
-        if needs_review:
-            ws.append([_text(rec.get(f)) or "Not Identified" for f in fields])
-
-    _style_header(ws)
-    _format_sheet(ws)
-    widths = {
-        "A": 20, "B": 16, "C": 36, "D": 24, "E": 28, "F": 28,
-        "G": 34, "H": 34, "I": 42, "J": 42, "K": 22, "L": 24,
-        "M": 34, "N": 16,
-    }
-    _format_sheet(ws, widths)
-    if ws.max_row > 1:
-        _add_table(ws, "VerificationQueue")
-
-
-def _build_naac_sheet(wb: Workbook, records: list[dict[str, Any]]) -> None:
-    ws = wb.create_sheet("NAAC_Mapping")
-    fields = [
-        "Record ID", "Academic Year", "Activity Date", "Activity Title", "Activity Type",
-        "Category", "Organizing Department", "NAAC Attribute", "NAAC Metric",
-        "Objective", "Outcome", "Evidence Available", "Evidence Gaps", "Source Report", "Source Page",
-        "Extraction Confidence", "Verification Status",
-    ]
-    ws.append(fields)
-    for rec in records:
-        ws.append([_text(rec.get(f)) or "Not Identified" for f in fields])
-
-    _style_header(ws)
-    _format_sheet(ws)
-    widths = {"A": 20, "B": 16, "C": 16, "D": 36, "E": 24, "F": 24, "G": 28,
-              "H": 36, "I": 34, "J": 42, "K": 42, "L": 40, "M": 42, "N": 34, "O": 16, "P": 24, "Q": 22}
-    _format_sheet(ws, widths)
-    if records:
-        _add_table(ws, "NAACMapping")
-
-
-def _build_evidence_sheet(wb: Workbook, records: list[dict[str, Any]]) -> None:
-    ws = wb.create_sheet("Evidence_Register")
-    fields = ["Record ID", "Academic Year", "Activity Date", "Activity Title", "Source Report", "Source Page"] + EVIDENCE_FIELDS
-    ws.append(fields)
-    for rec in records:
-        row = [_text(rec.get(f)) or "Not Identified" for f in fields]
-        ws.append(row)
-
-    _style_header(ws)
-    _format_sheet(ws)
-    for i, field in enumerate(fields, 1):
-        width = 24
-        if field == "Activity Title":
-            width = 36
-        elif field == "Source Report":
-            width = 34
-        elif field in EVIDENCE_FIELDS:
-            width = 20
-        ws.column_dimensions[get_column_letter(i)].width = width
-
-    if records:
-        _add_table(ws, "EvidenceRegister")
-
-
-def _build_quality_sheet(wb: Workbook, records: list[dict[str, Any]]) -> None:
-    ws = wb.create_sheet("Data_Quality_Report")
-    ws.append(["Record ID", "Activity Title", "Issue Type", "Severity", "Issue / Details", "Recommended Action", "Source Report"])
-
-    for rec in records:
-        rid = _text(rec.get("Record ID"))
-        title = _text(rec.get("Activity Title")) or "Not Identified"
-        source = _text(rec.get("Source Report")) or "Not Identified"
-
-        missing = _text(rec.get("Missing Information"))
-        if missing and missing != "None identified":
-            ws.append([rid, title, "Missing Information", "High", missing, "Verify the source report and complete the missing fields.", source])
-
-        gaps = _text(rec.get("Evidence Gaps"))
-        if gaps and gaps != "None identified":
-            ws.append([rid, title, "Evidence Gap", "Medium", gaps, "Check whether the evidence exists in the report or supporting files.", source])
-
-        status = _text(rec.get("Verification Status"))
-        if "possible duplicate" in status.lower():
-            ws.append([rid, title, "Possible Duplicate", "High", status, "Compare with the suspected duplicate before finalizing the master register.", source])
-        elif status and status.lower() != "verified":
-            ws.append([rid, title, "Verification", "Medium", status, "Review and verify the extracted record.", source])
-
-        confidence = _text(rec.get("Extraction Confidence"))
-        if "low" in confidence.lower():
-            ws.append([rid, title, "Low Confidence", "High", confidence, "Manually verify the complete record against the source document.", source])
-        elif "medium" in confidence.lower():
-            ws.append([rid, title, "Medium Confidence", "Medium", confidence, "Review important fields before final use.", source])
-
-        if _missing(rec.get("NAAC Attribute")) or _missing(rec.get("NAAC Metric")):
-            ws.append([rid, title, "NAAC Mapping", "Medium", "NAAC Attribute or Metric is not identified.", "Review the activity and confirm the applicable reference mapping.", source])
-
-    _style_header(ws)
-    _format_sheet(ws)
-    widths = {"A": 20, "B": 36, "C": 24, "D": 14, "E": 52, "F": 52, "G": 34}
-    _format_sheet(ws, widths)
-    if ws.max_row > 1:
-        _add_table(ws, "DataQualityReport")
-
-
-def _build_summary_sheet(wb: Workbook, records: list[dict[str, Any]]) -> None:
-    ws = wb.create_sheet("Summary", 0)
-    ws.sheet_view.showGridLines = False
+    # ---------- Dashboard ----------
+    _style_title(
+        dashboard,
+        "RTCCS IQAC Analyzer",
+        "Professional IQAC Activity & Evidence Workbook",
+        8,
+    )
+    dashboard.sheet_view.showGridLines = False
 
     total = len(records)
-    verified = sum(_text(r.get("Verification Status")).lower() == "verified" for r in records)
-    possible_dup = sum("possible duplicate" in _text(r.get("Verification Status")).lower() for r in records)
-    needs_review = total - verified
-    missing = sum(_text(r.get("Missing Information")) not in {"", "None identified"} for r in records)
-    evidence_gaps = sum(_text(r.get("Evidence Gaps")) not in {"", "None identified"} for r in records)
-    low_conf = sum("low" in _text(r.get("Extraction Confidence")).lower() for r in records)
+    verified = sum(_s(r.get("Verification Status")).lower() == "verified" for r in records)
+    duplicates = sum("duplicate" in _s(r.get("Verification Status")).lower() for r in records)
+    needs_review = sum(
+        _s(r.get("Verification Status")).lower() in {"needs verification", "possible duplicate"}
+        or bool(_s(r.get("Missing Information")))
+        for r in records
+    )
+    mapped = sum(
+        _s(r.get("NAAC Attribute")).lower() not in {"", "not identified"}
+        and _s(r.get("NAAC Metric")).lower() not in {"", "not identified"}
+        for r in records
+    )
+    evidence = sum(bool(_s(r.get("Evidence Available"))) for r in records)
 
-    ws.append(["RTCCS IQAC Analyzer — Processing Summary", ""])
-    ws.append([])
-    ws.append(["Indicator", "Value"])
-    metrics = [
+    cards = [
         ("Total Activities", total),
-        ("Verified Activities", verified),
-        ("Records Requiring Review", needs_review),
-        ("Possible Duplicates", possible_dup),
-        ("Records With Missing Information", missing),
-        ("Records With Evidence Gaps", evidence_gaps),
-        ("Low-Confidence Records", low_conf),
+        ("Verified", verified),
+        ("Needs Review", needs_review),
+        ("Possible Duplicates", duplicates),
+        ("NAAC Mapped", mapped),
+        ("Evidence Recorded", evidence),
     ]
-    for label, value in metrics:
-        ws.append([label, value])
 
-    ws.append([])
-    ws.append(["Activity Type", "Count"])
-    activity_types = Counter(_text(r.get("Activity Type")) or "Not Identified" for r in records)
-    for key, count in sorted(activity_types.items(), key=lambda x: (-x[1], x[0])):
-        ws.append([key, count])
+    row = 4
+    for i, (label, value) in enumerate(cards):
+        col = 1 + (i % 3) * 3
+        r = row + (i // 3) * 3
+        dashboard.merge_cells(start_row=r, start_column=col, end_row=r, end_column=col + 1)
+        dashboard.merge_cells(start_row=r + 1, start_column=col, end_row=r + 1, end_column=col + 1)
+        lc = dashboard.cell(r, col, label)
+        vc = dashboard.cell(r + 1, col, value)
+        lc.font = Font(size=10, bold=True, color=WHITE)
+        lc.fill = PatternFill("solid", fgColor=MID)
+        lc.alignment = Alignment(horizontal="center", vertical="center")
+        vc.font = Font(size=20, bold=True, color=DARK)
+        vc.fill = PatternFill("solid", fgColor=PALE)
+        vc.alignment = Alignment(horizontal="center", vertical="center")
+        dashboard.row_dimensions[r].height = 22
+        dashboard.row_dimensions[r + 1].height = 32
 
-    ws.append([])
-    ws.append(["NAAC Attribute", "Count"])
-    attrs = Counter(_text(r.get("NAAC Attribute")) or "Not Identified" for r in records)
-    for key, count in sorted(attrs.items(), key=lambda x: (-x[1], x[0])):
-        ws.append([key, count])
+    start = 11
+    dashboard.cell(start, 1, "Activity Type Distribution")
+    dashboard.cell(start, 1).font = Font(size=13, bold=True, color=DARK)
+    type_counts = Counter(_s(r.get("Activity Type")) or "Not Identified" for r in records)
+    dashboard.append([])
+    hdr = dashboard.max_row + 1
+    dashboard.cell(hdr, 1, "Activity Type")
+    dashboard.cell(hdr, 2, "Activities")
+    _style_header(dashboard[hdr])
+    for k, v in type_counts.most_common():
+        dashboard.append([k, v])
+    _style_body(dashboard, hdr + 1, dashboard.max_row, 1, 2)
 
-    # Visual formatting for the title and metric blocks.
-    ws[1][0].font = Font(bold=True, size=16)
-    ws[3][0].fill = HEADER_FILL
-    ws[3][1].fill = HEADER_FILL
-    ws[3][0].font = WHITE_FONT
-    ws[3][1].font = WHITE_FONT
+    attr_col = 4
+    dashboard.cell(start, attr_col, "NAAC Attribute Distribution")
+    dashboard.cell(start, attr_col).font = Font(size=13, bold=True, color=DARK)
+    attr_counts = Counter(_s(r.get("NAAC Attribute")) or "Not Identified" for r in records)
+    ah = hdr
+    dashboard.cell(ah, attr_col, "NAAC Attribute")
+    dashboard.cell(ah, attr_col + 1, "Activities")
+    _style_header(dashboard[ah][attr_col-1:attr_col+1])
+    for k, v in attr_counts.most_common():
+        dashboard.cell(dashboard.max_row + 1, attr_col, k)
+        dashboard.cell(dashboard.max_row, attr_col + 1, v)
+    _style_body(dashboard, ah + 1, dashboard.max_row, attr_col, attr_col + 1)
+    dashboard.freeze_panes = "A4"
+    for c in range(1, 9):
+        dashboard.column_dimensions[get_column_letter(c)].width = 22
 
-    for row in ws.iter_rows(min_row=4):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    # ---------- Master Data ----------
+    ws = wb.create_sheet("Master Activity Data")
+    _style_title(ws, "IQAC Master Activity Data", "Validated activity register", len(MASTER_COLUMNS))
+    header_row = 3
+    for col, name in enumerate(MASTER_COLUMNS, 1):
+        ws.cell(header_row, col, name)
+    _style_header(ws[header_row])
 
-    ws.column_dimensions["A"].width = 48
-    ws.column_dimensions["B"].width = 24
+    for r in records:
+        ws.append([r.get(c, "") for c in MASTER_COLUMNS])
+
+    if records:
+        _style_body(ws, header_row + 1, ws.max_row)
+        for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row):
+            # confidence
+            idx = MASTER_COLUMNS.index("Extraction Confidence") + 1
+            c = row[idx - 1]
+            n = _confidence(c.value)
+            if n is not None:
+                c.value = n
+                c.number_format = "0%"
+        _add_table(ws, f"A{header_row}:{get_column_letter(len(MASTER_COLUMNS))}{ws.max_row}", "IQACMasterData")
+
+        # Status / confidence formatting
+        status_col = MASTER_COLUMNS.index("Verification Status") + 1
+        conf_col = MASTER_COLUMNS.index("Extraction Confidence") + 1
+        ws.conditional_formatting.add(
+            f"{get_column_letter(status_col)}{header_row+1}:{get_column_letter(status_col)}{ws.max_row}",
+            FormulaRule(formula=[f'LOWER({get_column_letter(status_col)}{header_row+1})="verified"'],
+                        fill=PatternFill("solid", fgColor=GREEN)),
+        )
+        ws.conditional_formatting.add(
+            f"{get_column_letter(conf_col)}{header_row+1}:{get_column_letter(conf_col)}{ws.max_row}",
+            CellIsRule(operator="lessThan", formula=["0.70"], fill=PatternFill("solid", fgColor=RED)),
+        )
+
     ws.freeze_panes = "A4"
+    ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(MASTER_COLUMNS))}{max(ws.max_row, header_row)}"
+    _autofit(ws, 10, 38)
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.print_title_rows = "1:3"
 
+    # ---------- Verification Queue ----------
+    vq = wb.create_sheet("Verification Queue")
+    cols = ["Record ID", "Activity Title", "Issue", "Missing Information",
+            "Verification Status", "Source Report", "Source Page", "Recommended Action"]
+    _style_title(vq, "Verification Queue", "Records requiring human review", len(cols))
+    for i, c in enumerate(cols, 1):
+        vq.cell(3, i, c)
+    _style_header(vq[3])
+    issues = _issue_rows(records)
+    for row in issues:
+        vq.append(row)
+    if issues:
+        _style_body(vq, 4, vq.max_row)
+        _add_table(vq, f"A3:H{vq.max_row}", "VerificationQueue")
+    vq.freeze_panes = "A4"
+    _autofit(vq, 12, 45)
 
-def _build_readme_sheet(wb: Workbook) -> None:
-    ws = wb.create_sheet("Read_Me")
-    rows = [
-        ["RTCCS IQAC Analyzer — Workbook Guide"],
-        [],
-        ["Sheet", "Purpose"],
-        ["Summary", "High-level activity, verification, evidence and NAAC statistics for this export."],
-        ["IQAC_Master_Data", "Primary activity register containing the configured IQAC master columns."],
-        ["Verification_Queue", "Records that need human review because of status, confidence, missing information or evidence gaps."],
-        ["NAAC_Mapping", "Activity-level NAAC attribute/metric reference mapping and supporting context."],
-        ["Evidence_Register", "Evidence checklist for each activity record."],
-        ["Data_Quality_Report", "Action-oriented list of missing information, evidence gaps, verification issues and mapping gaps."],
-        [],
-        ["Important", "NAAC mappings are a reference/AI-assistance layer and are not an official NAAC score or determination."],
-        ["Important", "AI-extracted records should be verified by the responsible IQAC/department before official use."],
+    # ---------- NAAC Mapping ----------
+    nm = wb.create_sheet("NAAC Mapping")
+    ncols = ["Record ID", "Activity Title", "Activity Type", "NAAC Attribute",
+             "NAAC Metric", "Objective", "Outcome", "Evidence Available",
+             "Source Report", "Source Page", "Extraction Confidence",
+             "Verification Status"]
+    _style_title(nm, "NAAC Mapping", "AI/reference mapping for IQAC review; not an official NAAC score", len(ncols))
+    for i, c in enumerate(ncols, 1):
+        nm.cell(3, i, c)
+    _style_header(nm[3])
+    for r in records:
+        nm.append([
+            _s(r.get("Record ID")), _s(r.get("Activity Title")),
+            _s(r.get("Activity Type")), _s(r.get("NAAC Attribute")),
+            _s(r.get("NAAC Metric")), _s(r.get("Objective")),
+            _s(r.get("Outcome")), _s(r.get("Evidence Available")),
+            _s(r.get("Source Report")), _s(r.get("Source Page")),
+            _confidence(r.get("Extraction Confidence")),
+            _s(r.get("Verification Status")),
+        ])
+    if records:
+        _style_body(nm, 4, nm.max_row)
+        for row in nm.iter_rows(min_row=4, max_row=nm.max_row):
+            row[10].number_format = "0%"
+        _add_table(nm, f"A3:L{nm.max_row}", "NAACMapping")
+    nm.freeze_panes = "A4"
+    _autofit(nm, 12, 48)
+
+    # ---------- Evidence Register ----------
+    er = wb.create_sheet("Evidence Register")
+    ecols = ["Record ID", "Activity Title", "Evidence Available", "Evidence Link",
+             "Source Report", "Source Page", "Verification Status"]
+    _style_title(er, "Evidence Register", "Evidence traceability by activity", len(ecols))
+    for i, c in enumerate(ecols, 1):
+        er.cell(3, i, c)
+    _style_header(er[3])
+    for r in records:
+        er.append([
+            _s(r.get("Record ID")), _s(r.get("Activity Title")),
+            _s(r.get("Evidence Available")), _s(r.get("Evidence Link")),
+            _s(r.get("Source Report")), _s(r.get("Source Page")),
+            _s(r.get("Verification Status")),
+        ])
+    if records:
+        _style_body(er, 4, er.max_row)
+        _add_table(er, f"A3:G{er.max_row}", "EvidenceRegister")
+    er.freeze_panes = "A4"
+    _autofit(er, 12, 50)
+
+    # ---------- Data Quality ----------
+    dq = wb.create_sheet("Data Quality")
+    dcols = ["Record ID", "Activity Title", "Issue Type", "Details",
+             "Severity", "Source Report", "Source Page", "Suggested Action"]
+    _style_title(dq, "Data Quality Report", "Extraction, validation and verification issues", len(dcols))
+    for i, c in enumerate(dcols, 1):
+        dq.cell(3, i, c)
+    _style_header(dq[3])
+
+    for r in records:
+        rid = _s(r.get("Record ID"))
+        title = _s(r.get("Activity Title"))
+        source = _s(r.get("Source Report"))
+        page = _s(r.get("Source Page"))
+        missing = _s(r.get("Missing Information"))
+        conf = _confidence(r.get("Extraction Confidence"))
+        if missing and missing.lower() not in {"none", "not identified", "n/a"}:
+            dq.append([rid, title, "Missing Information", missing, "High", source, page, "Verify source document"])
+        if "duplicate" in _s(r.get("Verification Status")).lower():
+            dq.append([rid, title, "Possible Duplicate", _s(r.get("Verification Status")), "Medium", source, page, "Compare with matching record"])
+        if conf is not None and conf < 0.70:
+            dq.append([rid, title, "Low Confidence", f"Extraction confidence: {conf:.0%}", "Medium", source, page, "Review extracted fields"])
+        if _s(r.get("NAAC Attribute")).lower() in {"", "not identified"}:
+            dq.append([rid, title, "NAAC Mapping", "NAAC attribute not identified", "Medium", source, page, "Review NAAC reference mapping"])
+        if _s(r.get("NAAC Metric")).lower() in {"", "not identified"}:
+            dq.append([rid, title, "NAAC Mapping", "NAAC metric not identified", "Medium", source, page, "Review NAAC reference mapping"])
+        if _s(r.get("Outcome")) and not _s(r.get("Impact")):
+            dq.append([rid, title, "Impact Not Documented",
+                       "Outcome is documented; long-term impact is not identified.", "Low", source, page,
+                       "Do not infer impact; verify source if required"])
+
+    if dq.max_row >= 4:
+        _style_body(dq, 4, dq.max_row)
+        _add_table(dq, f"A3:H{dq.max_row}", "DataQuality")
+    dq.freeze_panes = "A4"
+    _autofit(dq, 12, 48)
+
+    # ---------- Read Me ----------
+    rm = wb.create_sheet("Read Me", 0)
+    _style_title(rm, "IQAC Analyzer — Workbook Guide",
+                 "How to interpret and use the generated workbook", 6)
+    instructions = [
+        ("Purpose", "This workbook consolidates extracted IQAC activity information from uploaded reports."),
+        ("Master Activity Data", "Primary activity register. Review before treating extracted values as final."),
+        ("Verification Queue", "Records with missing information, possible duplicates, low confidence or mapping gaps."),
+        ("NAAC Mapping", "Reference/AI-assisted mapping against the configured metric catalogue. It is not an official NAAC score or determination."),
+        ("Evidence Register", "Tracks evidence availability and source traceability."),
+        ("Data Quality", "Lists extraction and validation issues requiring attention."),
+        ("Confidence", "Extraction confidence is a data-quality indicator and should be reviewed alongside source evidence."),
+        ("Outcome vs Impact", "An undocumented impact is not inferred from an activity outcome."),
+        ("Recommended workflow", "Review flagged records, verify against source pages, then mark records as Verified."),
     ]
-    for row in rows:
-        ws.append(row)
-    _style_header(ws, 3)
-    ws[1][0].font = Font(bold=True, size=16)
-    ws.column_dimensions["A"].width = 32
-    ws.column_dimensions["B"].width = 110
-    for row in ws.iter_rows():
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-    ws.sheet_view.showGridLines = False
+    rm.cell(4, 1, "Section")
+    rm.cell(4, 2, "Guidance")
+    _style_header(rm[4][:2])
+    for a, b in instructions:
+        rm.append([a, b])
+    _style_body(rm, 5, rm.max_row, 1, 2)
+    rm.column_dimensions["A"].width = 28
+    rm.column_dimensions["B"].width = 100
+    rm.freeze_panes = "A5"
 
+    # Global print settings
+    for ws in wb.worksheets:
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.sheet_view.showGridLines = False
+        ws.sheet_properties.outlinePr.summaryBelow = True
+        ws.page_margins.left = 0.25
+        ws.page_margins.right = 0.25
+        ws.page_margins.top = 0.5
+        ws.page_margins.bottom = 0.5
 
-def build_excel_bytes(records: list[dict[str, Any]]) -> bytes:
-    """Build the IQAC workbook while preserving the existing app API.
-
-    The function intentionally keeps the original ``build_excel_bytes(records)``
-    signature so app.py does not need another change for this upgrade.
-    """
-    wb = Workbook()
-
-    _build_master_sheet(wb, records)
-    _build_summary_sheet(wb, records)
-    _build_verification_sheet(wb, records)
-    _build_naac_sheet(wb, records)
-    _build_evidence_sheet(wb, records)
-    _build_quality_sheet(wb, records)
-    _build_readme_sheet(wb)
-
-    # Put the master register first, followed by the user-facing summary.
-    wb._sheets = [wb["IQAC_Master_Data"], wb["Summary"], wb["Verification_Queue"], wb["NAAC_Mapping"], wb["Evidence_Register"], wb["Data_Quality_Report"], wb["Read_Me"]]
-
-    out = BytesIO()
-    wb.save(out)
-    return out.getvalue()
+    output = BytesIO()
+    wb.save(output)
+    return output.getvalue()
