@@ -543,8 +543,107 @@ provides a title or date anchor, return at least one Activity object.
                 pass
 
 
+def _extract_local_text(raw: bytes, filename: str) -> tuple[str, bool, str]:
+    """Extract page-labelled text locally before using Gemini file upload.
+
+    Returns (text, usable, method).  The fast path is deliberately conservative:
+    if a PDF looks scanned/image-only, the caller falls back to the original Gemini
+    PDF upload so visual evidence is not silently discarded.
+    """
+    suffix = Path(filename).suffix.lower()
+    try:
+        if suffix == ".txt":
+            text = raw.decode("utf-8", errors="replace")
+            return text.strip(), bool(text.strip()), "local-text"
+
+        if suffix == ".docx":
+            from docx import Document
+            import io
+            doc = Document(io.BytesIO(raw))
+            chunks = []
+            for p in doc.paragraphs:
+                if p.text.strip():
+                    chunks.append(p.text.strip())
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells]
+                    if any(cells):
+                        chunks.append(" | ".join(cells))
+            text = "\n".join(chunks).strip()
+            return text, len(text) >= 120, "local-docx"
+
+        if suffix == ".pdf":
+            import fitz
+            doc = fitz.open(stream=raw, filetype="pdf")
+            pages = []
+            total_chars = 0
+            nonspace = 0
+            alpha = 0
+            for idx, page in enumerate(doc, start=1):
+                page_text = page.get_text("text") or ""
+                cleaned = page_text.strip()
+                pages.append(f"\n--- PDF PAGE {idx} ---\n{cleaned}")
+                total_chars += len(cleaned)
+                nonspace += sum(not ch.isspace() for ch in cleaned)
+                alpha += sum(ch.isalpha() for ch in cleaned)
+            doc.close()
+            text = "\n".join(pages).strip()
+            page_count = max(1, len(pages))
+            avg_chars = total_chars / page_count
+            alpha_ratio = alpha / max(1, nonspace)
+            # Conservative threshold: use local text only when most pages contain
+            # meaningful machine-readable text. Scanned/image-heavy PDFs retain the
+            # original visual Gemini path.
+            usable = total_chars >= 500 and avg_chars >= 80 and alpha_ratio >= 0.35
+            return text, usable, "local-pdf-text" if usable else "pdf-visual-fallback"
+    except Exception:
+        return "", False, "extraction-failed"
+    return "", False, "unsupported"
+
+
+def _generate_structured(client, model: str, contents: list[Any]) -> ReportAnalysis:
+    response = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config={
+            "temperature": 0.1,
+            "response_mime_type": "application/json",
+            "response_schema": ReportAnalysis,
+        },
+    )
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, ReportAnalysis):
+        return parsed
+    raw_text = getattr(response, "text", "") or ""
+    if not raw_text:
+        raise GeminiError("Gemini returned an empty response.")
+    try:
+        return ReportAnalysis.model_validate_json(raw_text)
+    except Exception as exc:
+        raise GeminiError(f"Gemini returned invalid structured data: {exc}") from exc
+
+
 def _upload_and_analyze_once(raw: bytes, filename: str, model: str, api_key: str) -> ReportAnalysis:
     client = _client(api_key)
+    extracted_text, usable_text, extraction_method = _extract_local_text(raw, filename)
+    prompt = (
+        SYSTEM_PROMPT
+        + f"\n\nSOURCE FILE NAME: {filename}"
+        + f"\nLOCAL EXTRACTION MODE: {extraction_method}"
+    )
+
+    # UPGRADE 11 FAST PATH: for text-readable PDFs/DOCX/TXT, avoid Gemini Files upload
+    # and send compact page-labelled text directly. This removes upload, remote-file
+    # processing and cleanup latency.
+    if usable_text:
+        # Keep enough context for large reports while avoiding pathological payloads.
+        if len(extracted_text) > 180_000:
+            extracted_text = extracted_text[:180_000] + "\n--- END OF LOCALLY EXTRACTED TEXT (TRUNCATED) ---"
+        prompt += "\n\nAnalyze the complete locally extracted document text below. Preserve page markers.\n"
+        return _generate_structured(client, model, [prompt, extracted_text])
+
+    # VISUAL FALLBACK: scanned/image-heavy PDFs still go through Gemini's native PDF
+    # understanding so photographs, handwriting and tables are not silently lost.
     suffix = Path(filename).suffix.lower()
     temp_path: str | None = None
     remote_file = None
@@ -552,36 +651,15 @@ def _upload_and_analyze_once(raw: bytes, filename: str, model: str, api_key: str
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(raw)
             temp_path = tmp.name
-
         try:
             remote_file = client.files.upload(
                 file=temp_path,
                 config={"mime_type": _mime_for(filename)},
             )
         except TypeError:
-            # Older/newer SDK variants may accept the file without an explicit config.
             remote_file = client.files.upload(file=temp_path)
-
-        prompt = SYSTEM_PROMPT + f"\n\nSOURCE FILE NAME: {filename}\n\nAnalyze the complete uploaded document and return the structured report."
-        response = client.models.generate_content(
-            model=model,
-            contents=[remote_file, prompt],
-            config={
-                "temperature": 0.1,
-                "response_mime_type": "application/json",
-                "response_schema": ReportAnalysis,
-            },
-        )
-        parsed = getattr(response, "parsed", None)
-        if isinstance(parsed, ReportAnalysis):
-            return parsed
-        raw_text = getattr(response, "text", "") or ""
-        if not raw_text:
-            raise GeminiError("Gemini returned an empty response.")
-        try:
-            return ReportAnalysis.model_validate_json(raw_text)
-        except Exception as exc:
-            raise GeminiError(f"Gemini returned invalid structured data: {exc}") from exc
+        prompt += "\n\nAnalyze the complete uploaded document and return the structured report."
+        return _generate_structured(client, model, [remote_file, prompt])
     except GeminiError:
         raise
     except Exception as exc:
@@ -591,7 +669,6 @@ def _upload_and_analyze_once(raw: bytes, filename: str, model: str, api_key: str
             try:
                 client.files.delete(name=remote_file.name)
             except Exception:
-                # Gemini automatically expires uploaded files; deletion is best-effort.
                 pass
         if temp_path:
             try:
@@ -793,7 +870,7 @@ def _map_activity(a: Activity, source_file: str, index: int, report_year: str) -
         "Evidence Link": a.evidence_link,
         "Evidence Trace": _evidence_summary(evidence_trace),
         "Evidence Present Count": str(_evidence_present_count(evidence_trace)),
-        "Evidence Trace Details": json.dumps(evidence_trace, ensure_ascii=False),
+        "Evidence Trace Details": evidence_trace,
         "Proposal": e.proposal,
         "Notice": e.notice,
         "Programme Table": e.programme_table,
