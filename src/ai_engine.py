@@ -793,7 +793,7 @@ def _map_activity(a: Activity, source_file: str, index: int, report_year: str) -
         "Evidence Link": a.evidence_link,
         "Evidence Trace": _evidence_summary(evidence_trace),
         "Evidence Present Count": str(_evidence_present_count(evidence_trace)),
-        "Evidence Trace Details": evidence_trace,
+        "Evidence Trace Details": json.dumps(evidence_trace, ensure_ascii=False),
         "Proposal": e.proposal,
         "Notice": e.notice,
         "Programme Table": e.programme_table,
