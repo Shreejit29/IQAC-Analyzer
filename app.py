@@ -9,7 +9,10 @@ import streamlit as st
 from src.ai_engine import GeminiError, analyze_report, check_connection
 from src.document_parser import basic_metadata, validate_upload
 from src.excel_exporter import build_excel_bytes
-from src.record_utils import COLUMNS, EVIDENCE_FIELDS, NAAC_ATTRIBUTES, deduplicate_records, session_summary
+from src.record_utils import (
+    COLUMNS, EVIDENCE_FIELDS, NAAC_ATTRIBUTES, deduplicate_records,
+    normalize_record, session_summary,
+)
 
 st.set_page_config(page_title="IQAC Analyzer", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
 
@@ -137,39 +140,166 @@ if st.session_state.analysis_done:
     m5.metric("Possible Duplicates", summary["possible_duplicates"])
 
     if st.session_state.summaries:
-        st.dataframe(pd.DataFrame(st.session_state.summaries), width='stretch', hide_index=True)
+        st.dataframe(pd.DataFrame(st.session_state.summaries), width="stretch", hide_index=True)
 
     if st.session_state.records:
-        st.subheader("Review Extracted Activities")
-        st.caption("Edit any value that needs correction. Evidence status is a checklist, not a pass/fail judgment.")
-        df = pd.DataFrame(st.session_state.records).reindex(columns=COLUMNS).fillna("")
-        edited = st.data_editor(
-            df,
-            key="editor_df",
-            width='stretch',
-            height=620,
-            hide_index=True,
-            num_rows="fixed",
-            disabled=["Record ID", "Source Report", "Extraction Status"],
-            column_config={
-                "NAAC Attribute": st.column_config.SelectboxColumn("NAAC Attribute", options=NAAC_ATTRIBUTES, width="large"),
-                "Verification Status": st.column_config.SelectboxColumn("Verification Status", options=["Needs Verification", "Verified", "Possible Duplicate"], width="medium"),
-            },
+        st.subheader("🔎 Verification Center")
+        st.caption(
+            "Review the extracted records before using them as official IQAC data. "
+            "AI extraction is not treated as final approval."
         )
-        st.session_state.records = edited.to_dict(orient="records")
+
+        records_df = pd.DataFrame(st.session_state.records).reindex(columns=COLUMNS).fillna("")
+
+        vf1, vf2, vf3 = st.columns([1.4, 1.4, 2.2])
+        with vf1:
+            verification_filter = st.selectbox(
+                "Verification status",
+                ["All", "Needs Verification", "Possible Duplicate", "Verified"],
+                key="verification_filter",
+            )
+        with vf2:
+            confidence_filter = st.selectbox(
+                "Confidence",
+                ["All", "High", "Medium", "Low"],
+                key="confidence_filter",
+            )
+        with vf3:
+            search_text = st.text_input(
+                "Search activity / department / source",
+                placeholder="e.g. tree plantation, NSS, seminar...",
+                key="verification_search",
+            )
+
+        visible_mask = pd.Series(True, index=records_df.index)
+        if verification_filter != "All":
+            visible_mask &= records_df["Verification Status"].eq(verification_filter)
+        if confidence_filter != "All":
+            visible_mask &= records_df["Extraction Confidence"].str.startswith(confidence_filter, na=False)
+        if search_text.strip():
+            needle = search_text.strip().lower()
+            search_cols = ["Activity Title", "Organizing Department", "Organizing Committee", "Source Report"]
+            text_match = pd.Series(False, index=records_df.index)
+            for col in search_cols:
+                text_match |= records_df[col].astype(str).str.lower().str.contains(needle, regex=False, na=False)
+            visible_mask &= text_match
+
+        visible_df = records_df.loc[visible_mask].copy()
+
+        vc1, vc2, vc3, vc4 = st.columns(4)
+        vc1.metric("Records Shown", len(visible_df))
+        vc2.metric("Need Verification", int((records_df["Verification Status"] == "Needs Verification").sum()))
+        vc3.metric("Possible Duplicates", int((records_df["Verification Status"] == "Possible Duplicate").sum()))
+        vc4.metric("Low Confidence", int(records_df["Extraction Confidence"].astype(str).str.startswith("Low", na=False).sum()))
+
+        if not visible_df.empty:
+            issue_rows = []
+            for _, row in visible_df.iterrows():
+                missing = str(row.get("Missing Information", ""))
+                gaps = str(row.get("Evidence Gaps", ""))
+                issues = []
+                if missing and missing != "None identified":
+                    issues.append(f"Missing: {missing}")
+                if gaps and gaps != "None identified":
+                    issues.append(f"Evidence: {gaps}")
+                if str(row.get("Verification Status", "")) == "Possible Duplicate":
+                    issues.append(f"Duplicate of: {row.get('Duplicate Of', 'Not identified')}")
+                issue_rows.append({
+                    "Record ID": row.get("Record ID", ""),
+                    "Activity": row.get("Activity Title", ""),
+                    "Confidence": row.get("Extraction Confidence", ""),
+                    "Issues": " | ".join(issues) if issues else "No automatic issue detected",
+                })
+            st.dataframe(pd.DataFrame(issue_rows), width="stretch", hide_index=True)
+        else:
+            st.info("No records match the selected verification filters.")
+
+        # Only records currently visible in the verification filter are edited.
+        # This prevents an accidental bulk edit of hundreds of unrelated records.
+        st.subheader("✏️ Review / Edit Records")
+        st.caption(
+            "Edit the visible records. After editing, missing-information, evidence-gap and "
+            "confidence fields are recalculated automatically."
+        )
+
+        if not visible_df.empty:
+            editor_columns = [c for c in COLUMNS if c in visible_df.columns]
+            edited = st.data_editor(
+                visible_df[editor_columns],
+                key="verification_editor",
+                width="stretch",
+                height=620,
+                hide_index=True,
+                num_rows="fixed",
+                disabled=["Record ID", "Source Report", "Extraction Status", "Extraction Confidence", "Missing Information", "Evidence Gaps"],
+                column_config={
+                    "NAAC Attribute": st.column_config.SelectboxColumn(
+                        "NAAC Attribute", options=NAAC_ATTRIBUTES, width="large"
+                    ),
+                    "Verification Status": st.column_config.SelectboxColumn(
+                        "Verification Status",
+                        options=["Needs Verification", "Verified", "Possible Duplicate"],
+                        width="medium",
+                    ),
+                },
+            )
+
+            if st.button("💾 Apply Review Changes", type="primary", width="stretch"):
+                edited_records = edited.to_dict(orient="records")
+                visible_ids = set(visible_df["Record ID"].astype(str))
+                by_id = {str(r.get("Record ID")): r for r in st.session_state.records}
+
+                for edited_record in edited_records:
+                    record_id = str(edited_record.get("Record ID", ""))
+                    original = by_id.get(record_id)
+                    if original is None or record_id not in visible_ids:
+                        continue
+
+                    # Preserve system-generated metadata and duplicate fields.
+                    old_id = original.get("Record ID", record_id)
+                    old_source = original.get("Source Report", "Not Identified")
+                    old_duplicate = {
+                        k: original[k] for k in ("Duplicate Of", "Duplicate Similarity") if k in original
+                    }
+                    verification_status = edited_record.get("Verification Status", original.get("Verification Status", "Needs Verification"))
+
+                    refreshed = normalize_record(
+                        edited_record,
+                        old_source,
+                        1,
+                        str(edited_record.get("Source Page", original.get("Source Page", "Not Identified"))),
+                    )
+                    refreshed["Record ID"] = old_id
+                    refreshed["Source Report"] = old_source
+                    refreshed["Verification Status"] = verification_status
+                    refreshed.update(old_duplicate)
+                    by_id[record_id] = refreshed
+
+                st.session_state.records = list(by_id.values())
+                st.session_state.excel = build_excel_bytes(st.session_state.records)
+                st.success("Review changes applied and quality fields recalculated.")
+                st.rerun()
+
+        st.subheader("📋 Evidence Review")
+        evidence_columns = ["Record ID", "Activity Title", "Source Report"] + EVIDENCE_FIELDS + ["Evidence Gaps"]
+        evidence_df = pd.DataFrame(st.session_state.records).reindex(columns=evidence_columns).fillna("")
+        st.dataframe(evidence_df, width="stretch", hide_index=True)
+
+        st.subheader("📊 Current Master Data")
+        st.dataframe(
+            pd.DataFrame(st.session_state.records).reindex(columns=COLUMNS).fillna(""),
+            width="stretch",
+            hide_index=True,
+        )
+
         st.session_state.excel = build_excel_bytes(st.session_state.records)
-
-        st.subheader("Evidence Review")
-        evidence_df = pd.DataFrame(st.session_state.records)[["Record ID", "Activity Title", "Source Report"] + EVIDENCE_FIELDS + ["Evidence Gaps"]]
-        st.dataframe(evidence_df, width='stretch', hide_index=True)
-
         st.download_button(
             "⬇️ Download IQAC_Master_Data.xlsx",
             data=st.session_state.excel,
             file_name="IQAC_Master_Data.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
-            width='stretch',
+            width="stretch",
         )
     else:
         st.warning("No activities were extracted. Check the report type and Gemini configuration, then try again.")
