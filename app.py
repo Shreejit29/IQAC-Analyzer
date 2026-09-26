@@ -357,7 +357,7 @@ html[data-theme="dark"] [data-testid="stWidgetLabel"] {
 st.markdown(f"""
 <div class="iqac-hero">
     <div class="iqac-kicker">Institutional Quality Assurance</div>
-    <div class="iqac-title">📊 IQAC Analyzer</div>
+    <div class="iqac-title">📊 IQAC Report Analyzer</div>
     <div class="iqac-sub">
         AI-powered extraction, evidence review, validation and master-data preparation
         for IQAC activity reports.
