@@ -27,17 +27,32 @@ NAAC_METRICS = {
 
 
 RECOVERY_PROMPT = r"""
-ACTIVITY RECOVERY PASS
-The first analysis returned zero activities. Re-read the COMPLETE uploaded document and determine whether it contains
-one or more genuine institutional activities/events. Look especially for an Activity Sheet, Basic Summary, event title,
-date, venue, department/committee, objectives, participants, event report, attendance, photographs or feedback.
+ACTIVITY RECOVERY PASS — HIGH PRIORITY
+The previous structured extraction returned zero activities. This is a recovery pass for a college IQAC report.
 
-Important: supporting pages such as attendance sheets, notices, photographs and feedback usually belong to an already
-identified activity. Do NOT create separate activities for those supporting pages.
+Read the COMPLETE uploaded document again. Pay special attention to the FIRST 1–3 PAGES. Many RTCCS reports contain
+an "Activity Sheet", "Basic Summary", "IQAC Cell Activity Number", "Activity Number", "Type of Activity", "Title",
+"Date", "Time", "Venue", "Department/Committee/Association", "Objective", "Participants", "Coordinator", and
+"Outcome" fields near the beginning.
 
-If there is a genuine activity, return it as an Activity object even if some fields are Not Identified. If the document
-is only a standalone notice, attendance sheet, certificate, feedback form or unrelated administrative document with no
-identifiable event, return zero activities.
+If those anchors describe a real institutional event/activity, you MUST return exactly one Activity for that event,
+even when later pages are only attendance, photographs, feedback, notices or evidence. Do not require a programme table,
+invitation, certificate or publicity item.
+
+Examples of genuine activities include tree plantation drives, seminars, workshops, camps, awareness programmes,
+sports events, cultural events, NSS activities, extension activities and other college events.
+
+IMPORTANT:
+- A multi-page report for one event is ONE activity.
+- Attendance sheets, feedback forms, photographs, proposals and notices normally SUPPORT an activity; they are not
+  separate activities.
+- If the first pages clearly identify an activity, do not return zero activities.
+- Use "Not Identified" for fields that cannot be established.
+- Preserve exact institutional wording.
+- Do not invent values.
+
+Only return zero activities when the entire document genuinely contains no identifiable institutional activity,
+such as a standalone administrative document with no event context.
 """
 
 
@@ -342,13 +357,20 @@ def _upload_and_analyze(
         for attempt in range(1, max_retries + 1):
             try:
                 result = _upload_and_analyze_once(raw, filename, selected_model, api_key)
-                # Empty activity output is treated as a recoverable extraction problem rather than a successful
-                # analysis. A targeted second pass prevents scanned/structured reports from being silently lost.
+
+                # An empty activity list is NOT immediately accepted. This was causing
+                # activity reports to be reported as "No activities were extracted" even
+                # though a fallback model was available. First run a focused recovery pass;
+                # if that is still empty, continue to the next configured/fallback model.
                 if not result.activities:
-                    result = _recover_activities(raw, filename, selected_model, api_key)
-                if result.activities:
-                    return result
-                # A genuinely activity-free document is valid; return it so the UI can report zero activities.
+                    recovered = _recover_activities(raw, filename, selected_model, api_key)
+                    if recovered.activities:
+                        return recovered
+                    last_error = GeminiError(
+                        f"{selected_model} returned zero activities after recovery for {filename}."
+                    )
+                    continue
+
                 return result
             except Exception as exc:
                 last_error = exc
@@ -384,6 +406,13 @@ def _recover_activities(raw: bytes, filename: str, model: str, api_key: str) -> 
             remote_file = client.files.upload(file=temp_path)
 
         prompt = SYSTEM_PROMPT + "\n\n" + RECOVERY_PROMPT + "\n\n" + NAAC_METRIC_TEXT
+        prompt += """
+RECOVERY OUTPUT REQUIREMENT:
+If the first pages contain a recognizable institutional activity sheet/basic summary,
+populate one Activity object from those anchors. It is preferable to return one
+partially populated activity with Not Identified fields than to return zero activities
+for a genuine event report.
+"""
         prompt += f"\n\nSOURCE FILE NAME: {filename}\nReturn the structured report after this recovery pass."
         response = client.models.generate_content(
             model=model,
