@@ -125,8 +125,126 @@ EVIDENCE STATUS
 For each evidence type return exactly one of Present, Absent, or Unclear. Do not call an item Absent merely because
 it was not obvious in a cropped image; use Unclear when the report cannot establish the status.
 
+
+NAAC / BINARY ACCREDITATION REFERENCE MAPPING
+Use the following draft Binary Accreditation framework as a REFERENCE CLASSIFICATION layer only.
+It is not an official NAAC scoring calculator. Do not assign scores.
+
+Choose an attribute/metric when the activity/report content provides a defensible match.
+Do not leave these fields "Not Identified" merely because the report itself does not print a metric number.
+Infer the classification from the actual activity content, objective, methodology, target group and evidence,
+but do not invent facts about the activity.
+
+ATTRIBUTE 1 — Curriculum Design
+1.1 Outcome-based Curriculum
+1.2 Stakeholder Participation
+1.3 Curriculum Flexibility
+1.4 Practical and Industry Focus
+1.5 Practical/Skill Orientation
+1.6 Online and Blended Learning
+1.7 Curriculum Revision
+1.8 Indian Knowledge System
+
+ATTRIBUTE 2 — Faculty Resources
+2.1 Recruitment
+2.2 Pay and Allowances
+2.3 Faculty Diversity
+2.7 Faculty Quality
+(Use only when the report actually concerns faculty-resource matters.)
+
+ATTRIBUTE 3 — Infrastructure
+3.1 Physical Infrastructure
+3.2 Learning Resources
+3.3 IT Infrastructure
+3.4 Research Resources
+3.5 Divyangjan Friendly Facilities
+3.6 Innovation Resources
+
+ATTRIBUTE 4 — Financial Resources & Management
+4.1 & 4.2 Capital Income / Revenue Income
+4.3 & 4.4 Capital Expenditure / Revenue Expenditure
+4.5 Sustainability and Growth
+4.6 Financial Controls & Risk Management
+
+ATTRIBUTE 5 — Learning & Teaching
+5.1 Pedagogical Approaches
+5.2 Internships, Field Projects etc.
+5.3 Assessment Components
+5.4 Academic Grievances Redressal
+5.5 Catering to Diversity
+5.6 Learning Management System
+5.7 Industry Academia Linkage
+5.8 Adherence to Academic Calendar
+
+ATTRIBUTE 6 — Extended Curricular Engagements
+6.1 Technical/Domain related Clubs, activities and technical festivals
+6.2 Cultural Clubs and activities and festivals
+6.3 Mental health/wellbeing clubs and activities
+6.4 Value Education
+6.5 Sports clubs/teams and activities
+6.6 Community related (focus) activities including UBA
+
+ATTRIBUTE 7 — Governance and Administration
+7.1 Statutory Compliance and Public Disclosure
+7.2 Institutional Development Plan
+7.3 e-Governance
+7.4 Student & Employee Welfare
+7.5 Grievance Handling Mechanism
+7.6 Quality Assurance System
+7.7 Effective Leadership
+7.8 National, International, Inter-University Collaborations
+7.9 Efforts for Employability
+7.10 Faculty Retention
+
+ATTRIBUTE 8 — Student Outcomes
+8.1 Placements/Employment
+8.2 Graduate Progression
+8.3 Self-employment/Entrepreneurship
+8.4 Competitive Exams
+8.5 Awards/Prizes/Recognitions for curricular and extended curricular areas
+8.6 Student Enrolment
+8.7 Pass Percentage or Graduation Rate
+8.8 Student/Alumni Learning Experience
+
+ATTRIBUTE 9 — Research & Innovation Outcomes
+9.1 External Research Grants
+9.2 Research Publications
+9.3 Research Quality
+9.4 PhDs Awarded
+9.5 Research Fellowships
+9.6 IPRs Produced
+9.7 Consultancy and Training
+9.8 Research Collaboration
+9.9 Number of Student Startups
+
+ATTRIBUTE 10 — Sustainability Outcomes (Including Green Initiatives)
+10.1 Community Activities
+10.2 Waste and Water Management
+10.3 Progressing towards Net Zero
+10.4 Green Audits and Initiatives
+10.5 Collaborations with Industry/NGOs
+
+MAPPING DECISION RULES
+- Prefer the most specific metric supported by the activity.
+- A technical/domain mathematics activity may map to 6.1 when its content is a technical/domain activity.
+- A cultural competition/event may map to 6.2.
+- A sports activity may map to 6.5.
+- A value/awareness activity may map to 6.4 when its primary purpose is value education.
+- Community/outreach/UBA activities may map to 6.6 or 10.1 depending on whether the activity is primarily an extended-curricular/community engagement activity or a sustainability/green initiative.
+- Teaching methodology, learning activities, assessment, internships and industry-linked learning should be considered under Attribute 5 with the relevant 5.x metric.
+- Awards/recognitions should be considered under 8.5 when the report documents student awards/recognitions.
+- IQAC, quality assurance, audits, stakeholder satisfaction, quality initiatives and related institutional QA activities should be considered under 7.6.
+- Do not force a mapping when none of the documented metrics is actually supported. In that case use "Not Identified" and explain why in extraction_notes.
+- Never invent a metric solely to avoid "Not Identified".
+- Return the metric in the exact "number + title" form from this catalog, e.g. "6.1 Technical/Domain related Clubs, activities and technical festivals".
+
 SOURCE DISCIPLINE
 Every extracted value must be supported by the uploaded report. Do not use outside knowledge to fill missing values.
+
+FINAL CLASSIFICATION CHECK
+Before returning each activity, explicitly evaluate NAAC/Binary Attribute and Metric.
+If the activity clearly matches one of the reference metrics above, populate both fields.
+If it does not clearly match, use "Not Identified" and state the reason in extraction_notes.
 """
 
 
@@ -161,25 +279,12 @@ def _mime_for(filename: str) -> str:
 
 
 def _is_transient_gemini_error(exc: Exception) -> bool:
-    """Return True for temporary Gemini/API availability errors that are safe to retry."""
     message = str(exc).lower()
     transient_terms = (
-        "503",
-        "service unavailable",
-        "unavailable",
-        "overloaded",
-        "high demand",
-        "temporarily unavailable",
-        "deadline exceeded",
-        "timeout",
-        "timed out",
-        "429",
-        "resource exhausted",
-        "too many requests",
-        "500",
-        "502",
-        "504",
-        "internal server error",
+        "503", "service unavailable", "unavailable", "overloaded",
+        "high demand", "temporarily unavailable", "deadline exceeded",
+        "timeout", "timed out", "429", "resource exhausted",
+        "too many requests", "500", "502", "504", "internal server error",
     )
     return any(term in message for term in transient_terms)
 
@@ -191,13 +296,6 @@ def _upload_and_analyze(
     api_key: str,
     max_retries: int = 3,
 ) -> ReportAnalysis:
-    """
-    Analyze a report with automatic retry for temporary Gemini failures.
-
-    A successful Gemini response is returned unchanged. Persistent failures are
-    raised as GeminiError so the UI can show an AI error rather than falsely
-    reporting zero activities.
-    """
     last_error: Exception | None = None
 
     for attempt in range(1, max_retries + 1):
@@ -205,19 +303,14 @@ def _upload_and_analyze(
             return _upload_and_analyze_once(raw, filename, model, api_key)
         except Exception as exc:
             last_error = exc
-
             if not _is_transient_gemini_error(exc) or attempt >= max_retries:
                 if isinstance(exc, GeminiError):
                     raise
                 raise GeminiError(
                     f"Gemini analysis failed for {filename}: {exc}"
                 ) from exc
+            time.sleep(2 if attempt == 1 else 5)
 
-            # Exponential backoff: 2s, then 5s before the next attempt.
-            delay = 2 if attempt == 1 else 5
-            time.sleep(delay)
-
-    # Defensive fallback; the loop always returns or raises above.
     raise GeminiError(
         f"Gemini analysis failed for {filename}: {last_error}"
     ) from last_error
