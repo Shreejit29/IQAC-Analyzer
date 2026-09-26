@@ -583,6 +583,64 @@ if st.session_state.analysis_done:
             else:
                 st.warning("Field-level confidence was not identified for this activity.")
 
+        # Evidence Intelligence
+        st.markdown("""
+        <div class="iqac-section">
+            <div class="iqac-section-bar"></div>
+            <div>
+                <div class="iqac-section-title">🧾 Evidence Intelligence</div>
+                <div class="iqac-section-sub">Evidence categories identified directly from the uploaded report.</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        selected_evidence = selected if trace_records else {}
+        details = selected_evidence.get("Evidence Trace Details") or []
+        if isinstance(details, str):
+            try:
+                import json
+                details = json.loads(details)
+            except Exception:
+                details = []
+
+        if details:
+            present = [x for x in details if str(x.get("Status", "")).strip().lower() == "present"]
+            identified = len(details)
+            readiness = round((len(present) / identified) * 100) if identified else 0
+
+            ec1, ec2, ec3 = st.columns(3)
+            ec1.metric("Evidence Present", len(present))
+            ec2.metric("Evidence Categories", identified)
+            ec3.metric("Evidence Readiness", f"{readiness}%")
+
+            evidence_rows = []
+            for item in details:
+                status = str(item.get("Status", "Not Identified"))
+                icon = "✅" if status == "Present" else ("➖" if status == "Not Applicable" else "⚠️")
+                evidence_rows.append({
+                    "": icon,
+                    "Evidence": item.get("Evidence Type", ""),
+                    "Status": status,
+                    "Source Page": item.get("Source Page", "Not Identified"),
+                    "Notes": item.get("Notes", ""),
+                })
+            st.dataframe(pd.DataFrame(evidence_rows), width="stretch", hide_index=True)
+
+            missing_evidence = [
+                str(x.get("Evidence Type", ""))
+                for x in details
+                if str(x.get("Status", "")).strip().lower() == "not identified"
+            ]
+            if missing_evidence:
+                st.warning(
+                    "Evidence not identified: " + ", ".join(missing_evidence)
+                )
+        else:
+            st.info(
+                "No structured evidence trace is available for this record. "
+                "The general evidence fields below are still shown."
+            )
+
         st.markdown("""
         <div class="iqac-section">
             <div class="iqac-section-bar"></div>
