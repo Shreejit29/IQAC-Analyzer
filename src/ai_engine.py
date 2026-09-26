@@ -423,12 +423,13 @@ def _upload_and_analyze(
     filename: str,
     model: str,
     api_key: str,
-    max_retries: int = 3,
+    max_retries: int = 2,
 ) -> ReportAnalysis:
-    # Prefer the configured model, then use the stable lightweight fallback.
-    models_to_try = [model]
-    if model != "gemini-3.5-flash-lite":
-        models_to_try.append("gemini-3.5-flash-lite")
+    # FAST PATH: use the lightweight model first. The configured model is retained
+    # only as a fallback, so normal documents require a single Gemini generation call.
+    models_to_try = ["gemini-3.5-flash-lite"]
+    if model and model != "gemini-3.5-flash-lite":
+        models_to_try.append(model)
 
     last_error: Exception | None = None
     for selected_model in models_to_try:
@@ -436,11 +437,23 @@ def _upload_and_analyze(
             try:
                 result = _upload_and_analyze_once(raw, filename, selected_model, api_key)
 
-                # An empty activity list is NOT immediately accepted. This was causing
-                # activity reports to be reported as "No activities were extracted" even
-                # though a fallback model was available. First run a focused recovery pass;
-                # if that is still empty, continue to the next configured/fallback model.
+                # FAST PATH: if Gemini already identified a primary activity document
+                # and supplied title/date anchors, let the deterministic safety-net in
+                # analyze_report create the minimal record. Do NOT spend another Gemini
+                # call on recovery in this common case. Recovery is reserved for genuinely
+                # ambiguous zero-activity results.
                 if not result.activities:
+                    profile = result.document_profile
+                    has_anchor = (
+                        profile.is_primary_activity_document
+                        and (
+                            profile.activity_title_anchor not in {"", "Not Identified", "Unknown", "Unclear"}
+                            or profile.activity_date_anchor not in {"", "Not Identified", "Unknown", "Unclear"}
+                        )
+                    )
+                    if has_anchor:
+                        return result
+
                     recovered = _recover_activities(raw, filename, selected_model, api_key)
                     if recovered.activities:
                         return recovered
