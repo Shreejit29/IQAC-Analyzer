@@ -125,7 +125,7 @@ def render_file_chips(files: list[Any]) -> None:
         return
     bits = ["<div class='chips'>"]
     for item in files:
-        size_mb = len(item.getvalue()) / (1024 * 1024)
+        size_mb = getattr(item, "size", 0) / (1024 * 1024)
         ext = item.name.rsplit('.',1)[-1].upper() if '.' in item.name else 'FILE'
         bits.append(f"<div class='chip'><b>{ext}</b> {item.name}<span>{size_mb:.1f} MB</span></div>")
     bits.append("</div>")
@@ -214,7 +214,6 @@ if analyze:
     st.session_state.summaries = summaries
     st.session_state.analysis_done = True
     st.session_state.excel = build_excel_bytes(records) if records else None
-    st.rerun()
 
 
 if st.session_state.analysis_done:
