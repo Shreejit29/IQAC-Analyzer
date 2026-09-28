@@ -226,14 +226,14 @@ st.markdown(
 
 current_step = 1 if not st.session_state.analysis_done else 3
 workflow = [
-    ("1", "Upload"),
-    ("2", "AI Extract"),
-    ("3", "Review"),
-    ("4", "Download"),
+    (1, "Upload"),
+    (2, "AI Extract"),
+    (3, "Review"),
+    (4, "Download"),
 ]
 workflow_html = "".join(
     f'<div class="workflow-item {"active" if n <= current_step else ""}">'
-    f'<b>{num}</b>&nbsp; {label}</div>'
+    f'<b>{n}</b>&nbsp; {label}</div>'
     for n, label in workflow
 )
 st.markdown(f'<div class="workflow">{workflow_html}</div>', unsafe_allow_html=True)
