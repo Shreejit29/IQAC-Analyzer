@@ -8,7 +8,7 @@ import streamlit as st
 
 from src.ai_engine import GeminiError, analyze_report, check_connection
 from src.excel_exporter import build_excel_bytes
-from src.photo_evidence import build_photo_evidence_pdf, extract_color_photos
+from src.photo_evidence import build_photo_evidence_docx, extract_color_photos
 from src.record_utils import COLUMNS
 
 st.set_page_config(
@@ -34,7 +34,7 @@ API_KEY = setting("GEMINI_API_KEY")
 INSTITUTION = setting("INSTITUTION_NAME", "Ramsheth Thakur College of Commerce & Science")
 MAX_FILE_MB = int(setting("MAX_FILE_MB", "50"))
 
-for key, default in {"records": [], "summaries": [], "analysis_done": False, "excel": None, "photo_evidence_pdf": None, "photo_count": 0}.items():
+for key, default in {"records": [], "summaries": [], "analysis_done": False, "excel": None, "photo_evidence_docx": None, "photo_count": 0}.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -94,7 +94,7 @@ with c2:
     clear = st.button("Clear", width="stretch")
 
 if clear:
-    for key in ["records", "summaries", "analysis_done", "excel", "photo_evidence_pdf", "photo_count", "simple_editor"]:
+    for key in ["records", "summaries", "analysis_done", "excel", "photo_evidence_docx", "photo_count", "simple_editor"]:
         st.session_state.pop(key, None)
     st.rerun()
 
@@ -127,6 +127,8 @@ if analyze:
     st.session_state.records = records
     st.session_state.summaries = summaries
     st.session_state.analysis_done = True
+    st.session_state.photo_evidence_docx = None
+    st.session_state.photo_count = 0
     st.session_state.excel = build_excel_bytes(records) if records else None
 
 if st.session_state.analysis_done:
@@ -189,11 +191,11 @@ if st.session_state.analysis_done:
         ])
         st.dataframe(status_df, width="stretch", hide_index=True, height=min(430, max(100, 42 * (len(status_df) + 1))))
 
-        st.markdown('<div class="section-title">Color Photo Evidence</div><div class="section-sub">Extract only embedded color photographs from PDF reports and place each photo on its own A4 page with the activity title, date, time and venue.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Color Photo Evidence</div><div class="section-sub">Extract only embedded color photographs from PDF reports and place each photo on its own editable Word page with the activity title, date, time and venue. Works for both embedded photographs and scanned color photographs.</div>', unsafe_allow_html=True)
         photo_pdfs_available = [u for u in uploads if u.name.lower().endswith(".pdf")] if uploads else []
         p1, p2 = st.columns([1, 2])
         with p1:
-            generate_photo_pdf = st.button("📷 Generate Color Photo Evidence", width="stretch", help="Extract color photographs from the uploaded PDF reports. Logos, small decorative images and full-page scans are skipped where possible.")
+            generate_photo_docx = st.button("📷 Generate Color Photo Evidence", width="stretch", help="Extract color photographs from PDF reports, including photographs embedded inside scanned pages. Logos, small decorative images and grayscale scans are skipped where possible.")
         with p2:
             if not photo_pdfs_available:
                 st.caption("Upload at least one PDF report to generate photo evidence.")
@@ -202,26 +204,26 @@ if st.session_state.analysis_done:
             else:
                 st.caption("The original uploaded PDF reports are used; the master Excel file is unchanged.")
 
-        if generate_photo_pdf:
+        if generate_photo_docx:
             if not photo_pdfs_available:
                 st.warning("No PDF report is available for photo extraction.")
             else:
-                with st.spinner("Extracting color photographs and preparing the evidence PDF…"):
+                with st.spinner("Extracting color photographs and preparing the editable Word evidence…"):
                     photo_documents = [(u.getvalue(), u.name) for u in photo_pdfs_available]
                     photos = extract_color_photos(photo_documents, st.session_state.records)
-                    st.session_state.photo_evidence_pdf = build_photo_evidence_pdf(photos)
+                    st.session_state.photo_evidence_docx = build_photo_evidence_docx(photos)
                     st.session_state.photo_count = len(photos)
                 if photos:
                     st.success(f"Prepared {len(photos)} color photograph(s).")
                 else:
                     st.info("No qualifying color photographs were detected in the uploaded PDF reports.")
 
-        if st.session_state.photo_evidence_pdf:
+        if st.session_state.photo_evidence_docx:
             st.download_button(
-                "⬇️ Download Color Photo Evidence PDF",
-                data=st.session_state.photo_evidence_pdf,
-                file_name="IQAC_Color_Photo_Evidence.pdf",
-                mime="application/pdf",
+                "⬇️ Download Editable Color Photo Evidence Word File",
+                data=st.session_state.photo_evidence_docx,
+                file_name="IQAC_Color_Photo_Evidence.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 width="stretch",
             )
 
