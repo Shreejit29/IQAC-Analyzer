@@ -7,6 +7,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from functools import lru_cache
 
 from pydantic import BaseModel, Field
 
@@ -214,6 +215,7 @@ Return at least one activity when the document clearly describes one. Missing fa
 """.strip()
 
 
+@lru_cache(maxsize=4)
 def _client(api_key: str):
     try:
         from google import genai
@@ -423,9 +425,12 @@ def analyze_report(raw: bytes, filename: str, model: str, api_key: str) -> tuple
     if not api_key.strip():
         raise GeminiError("GEMINI_API_KEY is not configured.")
 
-    models = ["gemini-3.5-flash-lite"]
-    if model and model not in models:
+    # Prefer the configured model for quality and avoid an unnecessary first-model hop.
+    models = []
+    if model:
         models.append(model)
+    if "gemini-3.5-flash-lite" not in models:
+        models.append("gemini-3.5-flash-lite")
 
     last_error: Exception | None = None
     result: ReportAnalysis | None = None
