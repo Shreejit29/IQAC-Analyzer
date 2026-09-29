@@ -439,7 +439,7 @@ def analyze_report(raw: bytes, filename: str, model: str, api_key: str) -> tuple
     if not api_key.strip():
         raise GeminiError("GEMINI_API_KEY is not configured.")
 
-    selected_model = model or "gemini-2.5-flash-lite"
+    selected_model = model or "gemini-3.5-flash-lite"
     last_error: Exception | None = None
     result: ReportAnalysis | None = None
 
