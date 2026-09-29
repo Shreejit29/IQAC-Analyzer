@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
+import tempfile
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -15,6 +17,31 @@ from .record_utils import normalize_record
 
 class GeminiError(RuntimeError):
     pass
+
+
+# These are documentary evidence categories inside the uploaded activity document.
+# No separate photograph upload/evidence module is used.
+DOCUMENT_TYPES = [
+    "Proposal",
+    "Notice",
+    "Programme/Schedule",
+    "Invitation",
+    "Attendance",
+    "Event Report",
+    "Photographs",
+    "Feedback",
+    "Feedback Analysis",
+    "News/Publicity",
+    "Certificate",
+    "Appreciation Letter",
+    "Other Supporting Document",
+]
+
+
+class EvidenceItem(BaseModel):
+    document: str = "Not Identified"
+    status: str = "Not Identified"
+    source_page: str = "Not Identified"
 
 
 class Activity(BaseModel):
@@ -35,6 +62,7 @@ class Activity(BaseModel):
     feedback: str = "Not Identified"
     naac_attribute: str = "Not Identified"
     naac_metric: str = "Not Identified"
+    evidence: list[EvidenceItem] = Field(default_factory=list)
     source_page: str = "Not Identified"
 
 
@@ -43,31 +71,44 @@ class ReportAnalysis(BaseModel):
     activities: list[Activity] = Field(default_factory=list)
 
 
-SYSTEM_PROMPT = """
-You are an IQAC document analyzer for a college.
+SYSTEM_PROMPT = f"""
+You are the document-analysis engine for a college IQAC Analyzer.
 
-TASK:
-Read the supplied document and extract genuine college activities into structured records.
-This is an ANALYZER, not a report writer. Return concise factual data only.
+SCOPE
+- This is an IQAC ANALYZER, not an IQAC report generator.
+- Extract facts from the supplied document and return structured data only.
+- Do not write a new report.
+- Do not invent facts.
+- If a field is genuinely unsupported, return exactly "Not Identified".
+- Treat only the supplied document as evidence. Do not use general knowledge to fill missing facts.
 
-RULES:
-- Identify every distinct genuine activity described in the document.
-- Do not create separate activities for notices, attendance sheets, circulars, certificates or supporting pages that belong to the same event.
-- If the document describes one event, normally return one activity.
-- Combine information about the same event from different pages.
-- Never invent facts.
-- If a field is not supported by the document, return exactly "Not Identified".
-- Preserve names, dates, counts and terminology accurately.
-- Do not copy long paragraphs. Summarize concisely.
-- Use the actual event date, not document creation/submission date.
-- Participants may include both group and count when stated.
-- Outcome must be a reported outcome, not an assumed benefit.
-- Follow-up Action only if explicitly stated.
-- Feedback only if actual feedback or feedback collection is described.
+ACTIVITY DETECTION
+1. Identify each distinct genuine activity described in the supplied document.
+2. One genuine activity = one Activity object.
+3. Do not create separate activities merely because the file contains a notice, attendance sheet, feedback page, photographs, certificate, or other evidence belonging to the same activity.
+4. If the document describes several unrelated activities, create one object per activity.
+5. Consolidate information across pages that clearly belongs to the same activity.
 
-NAAC MAPPING:
-Select one conservative best-fit Attribute and Metric only when supported by the activity.
-Use this internal reference:
+FIELD RULES
+Academic Year: use the stated academic/session year.
+Activity Date: use the actual event date, not approval/submission/publication dates.
+Activity Title: use the formal title when available.
+Activity Type: identify the event type from context.
+Category: use the stated category or a conservative contextual category.
+Organizing Department / Committee: identify the organizer.
+Collaborating Agency: identify actual partner/collaborator, not merely the organizer.
+Resource Person: identify named speakers/experts/trainers/guests.
+Venue: identify the actual event location.
+Participants: preserve supported groups/counts exactly.
+Objective: extract stated aims/purposes, not outcomes.
+Activity Description: concise factual summary.
+Outcome: extract reported results/impact only; do not infer.
+Follow-up Action: extract explicit next steps only.
+Feedback: extract actual feedback information, or "Feedback collected" only when collection is explicitly stated.
+Source Page: give the PDF page number/range supporting the activity. For DOCX/TXT, use "Not Identified" unless the source itself gives page numbers.
+
+NAAC MAPPING
+Select one best-fit Attribute and one best-fit Metric conservatively from this internal catalog:
 1 Curriculum Design: 1.1-1.8
 2 Faculty Resources: 2.1, 2.2, 2.3, 2.7
 3 Infrastructure: 3.1-3.6
@@ -79,23 +120,39 @@ Use this internal reference:
 9 Research & Innovation Outcomes: 9.1-9.9
 10 Sustainability Outcomes (Including Green Initiatives): 10.1-10.5
 
-Useful examples:
-- Student technical/domain activities and competitions -> Attribute 6, Metric 6.1 when supported.
+Useful conservative examples:
+- Student technical/domain competitions and similar extension activities -> Attribute 6, often 6.1 when supported.
 - Cultural activities -> 6.2.
-- Student health/wellbeing -> 6.3.
+- Student wellbeing/health activities -> 6.3.
 - Value education/ethics -> 6.4.
 - Sports -> 6.5.
-- NSS/community outreach -> 6.6.
+- Community service/NSS/UBA/outreach -> 6.6.
 - IQAC/quality assurance -> 7.6.
-- Explicit green/environment initiatives -> Attribute 10, Metric 10.4.
+- Explicit environmental/green initiatives -> Attribute 10, typically 10.4.
+These mappings are internal references, not an official accreditation determination.
 
-SOURCE PAGE:
-- For PDFs, provide page number(s) supporting the activity, such as "2-4" or "2, 5".
-- For DOCX/TXT, use "Not Identified" unless page information is explicitly available.
+DOCUMENT PRESENCE
+Return exactly one EvidenceItem for every type, in this exact order:
+{', '.join(DOCUMENT_TYPES)}
 
-OUTPUT:
-Return only the structured activity data requested by the schema.
-"""
+Status must be exactly one of: Present, Absent, Not Identified.
+- Present: the uploaded document visibly/explicitly contains that evidence.
+- Absent: the uploaded document has been sufficiently checked and that evidence is not present.
+- Not Identified: the file is ambiguous/unreadable or does not allow a reliable determination.
+- Never infer that evidence exists because an activity normally has it.
+- "Attendance will be taken" does not make Attendance Present.
+- An attendance sheet/table makes Attendance Present.
+- Visible photographs embedded in the supplied document make Photographs Present.
+- Do not separately process or require photo uploads.
+- If a section explicitly says a document is not attached/not available/NA, mark Absent.
+- For Present, source_page must show where it appears. For Absent and Not Identified use "Not Identified".
+
+OUTPUT QUALITY
+- Keep fields concise and factual.
+- Preserve names, dates, counts and titles.
+- Do not copy large paragraphs.
+- Do not invent.
+""".strip()
 
 
 @lru_cache(maxsize=4)
@@ -111,10 +168,38 @@ def check_connection(api_key: str, model: str) -> tuple[bool, str]:
     if not api_key.strip():
         return False, "GEMINI_API_KEY is not configured."
     try:
-        _client(api_key)
+        client = _client(api_key)
+        model_ids: set[str] = set()
+        try:
+            for item in client.models.list():
+                model_name = getattr(item, "name", "") or getattr(item, "id", "")
+                model_ids.add(str(model_name).replace("models/", ""))
+        except Exception:
+            # A models-list failure should not prevent actual document analysis.
+            pass
+        if model_ids and model not in model_ids:
+            return False, f"Gemini model '{model}' is not available for this account."
         return True, f"Gemini is configured ({model})."
     except Exception as exc:
-        return False, f"Gemini connection check failed: {exc}"
+        return False, f"Gemini connection/model check failed: {exc}"
+
+
+def _is_retryable(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "timeout",
+            "timed out",
+            "unavailable",
+            "resource exhausted",
+        )
+    )
 
 
 def _extract_local_text(raw: bytes, filename: str) -> tuple[str, bool]:
@@ -126,47 +211,85 @@ def _extract_local_text(raw: bytes, filename: str) -> tuple[str, bool]:
 
         if suffix == ".docx":
             from docx import Document
+
             doc = Document(io.BytesIO(raw))
-            chunks = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            chunks: list[str] = []
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():
+                    chunks.append(paragraph.text.strip())
             for table in doc.tables:
                 for row in table.rows:
-                    cells = [c.text.strip() for c in row.cells]
+                    cells = [cell.text.strip() for cell in row.cells]
                     if any(cells):
                         chunks.append(" | ".join(cells))
             text = "\n".join(chunks).strip()
-            return text, bool(text)
-
+            return text, len(text) >= 80
     except Exception:
         return "", False
 
     return "", False
 
 
-def _fallback_title_date(text: str) -> tuple[str, str]:
-    title_patterns = [
-        r"(?:activity\s+title|event\s+title|programme\s+title|title)\s*[:\-]\s*([^\n|]{5,180})",
+def _schema() -> dict[str, Any]:
+    evidence_item = {
+        "type": "object",
+        "properties": {
+            "document": {"type": "string"},
+            "status": {
+                "type": "string",
+                "enum": ["Present", "Absent", "Not Identified"],
+            },
+            "source_page": {"type": "string"},
+        },
+        "required": ["document", "status", "source_page"],
+        "additionalProperties": False,
+    }
+
+    field_names = [
+        "academic_year",
+        "activity_date",
+        "activity_title",
+        "activity_type",
+        "category",
+        "organizing_department_committee",
+        "collaborating_agency",
+        "resource_person",
+        "venue",
+        "participants",
+        "objective",
+        "activity_description",
+        "outcome",
+        "follow_up_action",
+        "feedback",
+        "naac_attribute",
+        "naac_metric",
+        "source_page",
     ]
-    date_patterns = [
-        r"(?:date|held on|conducted on|event date)\s*[:\-]\s*([^\n|]{5,100})",
-    ]
-    title = ""
-    date = ""
-    for pattern in title_patterns:
-        m = re.search(pattern, text, re.I)
-        if m:
-            title = " ".join(m.group(1).split()).strip(" :;-|")
-            break
-    for pattern in date_patterns:
-        m = re.search(pattern, text, re.I)
-        if m:
-            date = " ".join(m.group(1).split()).strip(" :;-|")
-            break
-    return title, date
+    properties = {name: {"type": "string"} for name in field_names}
+    properties["evidence"] = {"type": "array", "items": evidence_item}
+
+    activity_schema = {
+        "type": "object",
+        "properties": properties,
+        "required": field_names + ["evidence"],
+        "additionalProperties": False,
+    }
+
+    return {
+        "type": "object",
+        "properties": {
+            "academic_year": {"type": "string"},
+            "activities": {"type": "array", "items": activity_schema},
+        },
+        "required": ["academic_year", "activities"],
+        "additionalProperties": False,
+    }
 
 
 def _generate(client: Any, model: str, contents: Any) -> ReportAnalysis:
     try:
         from google.genai import types
+
         response = client.models.generate_content(
             model=model,
             contents=contents,
@@ -174,128 +297,172 @@ def _generate(client: Any, model: str, contents: Any) -> ReportAnalysis:
                 system_instruction=SYSTEM_PROMPT,
                 temperature=0,
                 response_mime_type="application/json",
-                response_schema=ReportAnalysis,
+                response_schema=_schema(),
             ),
         )
     except Exception as exc:
         raise GeminiError(str(exc)) from exc
 
+    text = getattr(response, "text", "") or ""
+    if not text:
+        raise GeminiError("Gemini returned an empty response.")
+
     try:
-        parsed = response.parsed
-        if parsed is not None:
-            return ReportAnalysis.model_validate(parsed)
-        text = response.text or ""
-        return ReportAnalysis.model_validate_json(text)
+        return ReportAnalysis.model_validate(json.loads(text))
     except Exception as exc:
         raise GeminiError(f"Gemini returned invalid structured data: {exc}") from exc
 
 
-def _analyze_once(raw: bytes, filename: str, model: str, api_key: str) -> ReportAnalysis:
-    client = _client(api_key)
-    suffix = Path(filename).suffix.lower()
-
-    # PDFs are sent natively to Gemini. No page rendering, OCR pipeline,
-    # photo-evidence extraction, or multi-call vision fallback is used.
-    if suffix == ".pdf":
-        from google.genai import types
-        prompt = (
-            f"Analyze this PDF: {filename}\n"
-            "Extract all genuine IQAC/college activities described in the complete PDF. "
-            "Use PDF page numbers for source_page. Ignore decorative photographs and "
-            "supporting-document details unless they help establish the activity."
-        )
-        part = types.Part.from_bytes(data=raw, mime_type="application/pdf")
-        return _generate(client, model, [part, prompt])
-
-    text, usable = _extract_local_text(raw, filename)
-    if not usable:
-        raise GeminiError(
-            f"Could not extract readable text from {filename}. "
-            "Please upload a text-based PDF, DOCX, or TXT file."
-        )
-
-    # Keep local text bounded for non-PDF files while retaining the beginning and end.
-    if len(text) > 300_000:
-        text = text[:240_000] + "\n--- MIDDLE OF DOCUMENT OMITTED LOCALLY ---\n" + text[-60_000:]
-
-    prompt = (
-        f"Analyze this document: {filename}\n"
-        "Extract all genuine IQAC/college activities. "
-        "This is the complete text extracted from the document:\n\n" + text
-    )
-    return _generate(client, model, prompt)
+def _upload_pdf(client: Any, raw: bytes, filename: str):
+    suffix = Path(filename).suffix or ".pdf"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+    try:
+        return client.files.upload(file=tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
-def _map_activity(activity: Activity, source_report: str, index: int, report_year: str) -> dict[str, str]:
-    raw = {
-        "Record ID": f"IQAC-{index:04d}",
-        "Academic Year": activity.academic_year if activity.academic_year != "Not Identified" else report_year,
-        "Activity Date": activity.activity_date,
-        "Activity Title": activity.activity_title,
-        "Activity Type": activity.activity_type,
-        "Category": activity.category,
-        "Organizing Department / Committee": activity.organizing_department_committee,
-        "Collaborating Agency": activity.collaborating_agency,
-        "Resource Person": activity.resource_person,
-        "Venue": activity.venue,
-        "Participants": activity.participants,
-        "Objective": activity.objective,
-        "Activity Description": activity.activity_description,
-        "Outcome": activity.outcome,
-        "Follow-up Action": activity.follow_up_action,
-        "Feedback": activity.feedback,
-        "NAAC Attribute": activity.naac_attribute,
-        "NAAC Metric": activity.naac_metric,
-        "Source Report": source_report,
-        "Source Page": activity.source_page,
+def _normalize_document_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _map_evidence(activity: Activity) -> tuple[str, str]:
+    evidence_by_name = {
+        _normalize_document_name(item.document): item
+        for item in activity.evidence
+        if item.document.strip()
     }
-    return normalize_record(raw, source_report, index)
+
+    present: list[str] = []
+    absent: list[str] = []
+
+    for document_name in DOCUMENT_TYPES:
+        item = evidence_by_name.get(_normalize_document_name(document_name))
+        if not item:
+            # Defensive fallback. The schema/prompt should normally prevent this.
+            absent.append(document_name)
+            continue
+
+        status = item.status.strip().lower()
+        if status == "present":
+            page = item.source_page.strip()
+            if page and page.lower() != "not identified":
+                present.append(f"{document_name} (p. {page})")
+            else:
+                present.append(document_name)
+        elif status == "absent":
+            absent.append(document_name)
+
+    return (
+        "; ".join(present) if present else "None Identified",
+        "; ".join(absent) if absent else "None Identified",
+    )
 
 
-def analyze_report(raw: bytes, filename: str, model: str, api_key: str) -> tuple[list[dict[str, str]], dict[str, str]]:
+def _map_activity(
+    activity: Activity,
+    source_report: str,
+    index: int,
+    academic_year: str,
+) -> dict[str, str]:
+    present, absent = _map_evidence(activity)
+    data = activity.model_dump()
+    effective_year = data.get("academic_year") or academic_year or "Not Identified"
+
+    field_map = {
+        "academic_year": "Academic Year",
+        "activity_date": "Activity Date",
+        "activity_title": "Activity Title",
+        "activity_type": "Activity Type",
+        "category": "Category",
+        "organizing_department_committee": "Organizing Department / Committee",
+        "collaborating_agency": "Collaborating Agency",
+        "resource_person": "Resource Person",
+        "venue": "Venue",
+        "participants": "Participants",
+        "objective": "Objective",
+        "activity_description": "Activity Description",
+        "outcome": "Outcome",
+        "follow_up_action": "Follow-up Action",
+        "feedback": "Feedback",
+        "naac_attribute": "NAAC Attribute",
+        "naac_metric": "NAAC Metric",
+        "source_page": "Source Page",
+    }
+
+    flat: dict[str, Any] = {
+        target: data.get(source, "Not Identified")
+        for source, target in field_map.items()
+    }
+    flat["Academic Year"] = effective_year
+    flat["Documents Present"] = present
+    flat["Documents Absent"] = absent
+    flat["Source Report"] = source_report
+    flat["Record ID"] = f"IQAC-{index:04d}"
+
+    return normalize_record(flat, source_report, index)
+
+
+def _analysis_prompt() -> str:
+    return (
+        "Analyze this complete IQAC source document. Identify every distinct genuine activity, "
+        "extract the required activity fields, and complete the document-presence checklist. "
+        "Return only the required structured JSON."
+    )
+
+
+def _generate_with_retry(client: Any, model: str, contents: Any) -> ReportAnalysis:
+    last_error: Exception | None = None
+    for attempt, delay in enumerate((0, 2, 5), start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            return _generate(client, model, contents)
+        except Exception as exc:
+            last_error = exc
+            if not _is_retryable(exc) or attempt == 3:
+                break
+    raise GeminiError(str(last_error) if last_error else "Gemini analysis failed.")
+
+
+def analyze_report(
+    raw: bytes,
+    filename: str,
+    model: str,
+    api_key: str,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if not api_key.strip():
         raise GeminiError("GEMINI_API_KEY is not configured.")
 
-    selected_model = model or "gemini-3.5-flash-lite"
-    last_error = None
+    client = _client(api_key)
+    suffix = Path(filename).suffix.lower()
+    prompt = _analysis_prompt()
 
-    # Only retry transient server/rate-limit errors once. This avoids
-    # duplicate calls for permanent errors such as invalid keys or models.
-    for attempt in range(2):
-        try:
-            result = _analyze_once(raw, filename, selected_model, api_key)
-            break
-        except Exception as exc:
-            last_error = exc
-            msg = str(exc).lower()
-            transient = any(x in msg for x in (
-                "429", "500", "502", "503", "504",
-                "resource exhausted", "temporarily unavailable", "timeout"
-            ))
-            if not transient or attempt == 1:
-                raise GeminiError(f"Analysis failed for {filename}: {exc}") from exc
-            time.sleep(2)
-    else:
-        raise GeminiError(f"Analysis failed for {filename}: {last_error}") from last_error
+    try:
+        if suffix == ".pdf":
+            uploaded = _upload_pdf(client, raw, filename)
+            result = _generate_with_retry(client, model, [prompt, uploaded])
+        else:
+            text, usable = _extract_local_text(raw, filename)
+            if not usable:
+                raise GeminiError(
+                    f"Could not extract usable text from {filename}. Please use a readable PDF/DOCX/TXT file."
+                )
+            result = _generate_with_retry(client, model, [prompt, text])
+    except GeminiError as exc:
+        raise GeminiError(f"Analysis failed for {filename}: {exc}") from exc
+    except Exception as exc:
+        raise GeminiError(f"Analysis failed for {filename}: {exc}") from exc
 
     records = [
-        _map_activity(a, filename, idx, result.academic_year)
-        for idx, a in enumerate(result.activities, start=1)
+        _map_activity(activity, filename, index, result.academic_year)
+        for index, activity in enumerate(result.activities, start=1)
     ]
-
-    # Small local fallback for unusually simple readable documents.
-    if not records:
-        text, usable = _extract_local_text(raw, filename)
-        if usable:
-            title, date = _fallback_title_date(text)
-            if title:
-                fallback = Activity(
-                    academic_year=result.academic_year,
-                    activity_title=title,
-                    activity_date=date or "Not Identified",
-                    activity_description="Extracted from the source document.",
-                )
-                records = [_map_activity(fallback, filename, 1, result.academic_year)]
 
     return records, {
         "Academic Year": result.academic_year,
