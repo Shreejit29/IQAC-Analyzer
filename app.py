@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import pandas as pd
@@ -591,35 +592,68 @@ if analyze:
     progress = st.progress(0, text="Starting analysis…")
 
     total = len(uploads)
-    for index, uploaded in enumerate(uploads, start=1):
-        try:
-            raw = uploaded.getvalue()
-            if len(raw) > MAX_FILE_MB * 1024 * 1024:
-                raise GeminiError(
-                    f"{uploaded.name} exceeds the {MAX_FILE_MB} MB file limit."
-                )
+
+    # Performance optimization: analyze a few documents concurrently instead of
+    # waiting for every Gemini request to finish before starting the next one.
+    # Three workers keeps the app responsive without flooding the free-tier API.
+    max_workers = min(3, total)
+    jobs: list[tuple[int, str, bytes]] = []
+    for idx, uploaded in enumerate(uploads):
+        raw = uploaded.getvalue()
+        if len(raw) > MAX_FILE_MB * 1024 * 1024:
+            st.error(f"{uploaded.name} exceeds the {MAX_FILE_MB} MB file limit.")
+            continue
+        jobs.append((idx, uploaded.name, raw))
+
+    completed = 0
+    results: dict[int, tuple[str, list[dict[str, str]], dict[str, Any]]] = {}
+
+    def run_one(job: tuple[int, str, bytes]):
+        idx, filename, raw = job
+        records, summary = analyze_report(
+            raw=raw,
+            filename=filename,
+            model=MODEL,
+            api_key=API_KEY,
+        )
+        return idx, filename, records, summary
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(run_one, job): job for job in jobs}
+
+        for future in as_completed(future_map):
+            completed += 1
+            job = future_map[future]
+            try:
+                idx, filename, records, summary = future.result()
+                results[idx] = (filename, records, summary)
+            except GeminiError as exc:
+                idx, filename, _ = job
+                results[idx] = (filename, [], {"error": str(exc)})
+            except Exception as exc:
+                idx, filename, _ = job
+                results[idx] = (filename, [], {"error": f"Unexpected error while analyzing {filename}: {exc}"})
 
             progress.progress(
-                (index - 1) / total,
-                text=f"Analyzing {uploaded.name} ({index}/{total})…",
+                completed / max(1, len(jobs)),
+                text=f"Analyzed {completed}/{len(jobs)} documents…",
             )
-            records, summary = analyze_report(
-                raw=raw,
-                filename=uploaded.name,
-                model=MODEL,
-                api_key=API_KEY,
-            )
-            start_index = len(all_records) + 1
-            for offset, record in enumerate(records):
-                record["Record ID"] = f"IQAC-{start_index + offset:04d}"
-                all_records.append(record)
-            summary["File"] = uploaded.name
-            summaries.append(summary)
-        except GeminiError as exc:
-            st.error(str(exc))
-        except Exception as exc:
-            st.error(f"Unexpected error while analyzing {uploaded.name}: {exc}")
 
+    # Restore upload order so the exported master data remains deterministic.
+    next_record_id = 1
+    for idx in sorted(results):
+        filename, records, summary = results[idx]
+        if "error" in summary:
+            st.error(summary["error"])
+            continue
+        for record in records:
+            record["Record ID"] = f"IQAC-{next_record_id:04d}"
+            next_record_id += 1
+            all_records.append(record)
+        summary["File"] = filename
+        summaries.append(summary)
+
+    # Show completion once all concurrent tasks have finished.
     progress.progress(1.0, text="Analysis complete")
     st.session_state.records = all_records
     st.session_state.summaries = summaries
