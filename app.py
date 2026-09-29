@@ -6,7 +6,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from src.ai_engine import GroqError, analyze_report
+from src.ai_engine import GeminiError, analyze_report
 from src.excel_exporter import build_excel_bytes
 from src.record_utils import COLUMNS
 
@@ -28,8 +28,8 @@ def setting(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
-MODEL = setting("GROQ_MODEL", "qwen/qwen3.8-27b")
-API_KEY = setting("GROQ_API_KEY")
+MODEL = setting("GEMINI_MODEL", "gemini-2.5-flash-lite")
+API_KEY = setting("GEMINI_API_KEY")
 INSTITUTION = setting("INSTITUTION_NAME", "Ramsheth Thakur College of Commerce & Science")
 MAX_FILE_MB = int(setting("MAX_FILE_MB", "50"))
 
@@ -155,7 +155,7 @@ st.markdown(
 render_workflow(3 if st.session_state.analysis_done else 1)
 
 if not API_KEY:
-    st.error("Groq API is not configured. Add GROQ_API_KEY to Streamlit Secrets.")
+    st.error("Gemini API is not configured. Add GEMINI_API_KEY to Streamlit Secrets.")
     st.stop()
 
 st.markdown(
@@ -184,7 +184,7 @@ x1,x2 = st.columns([2,4])
 with x1:
     analyze = st.button("✨ Extract activities", type="primary", width="stretch")
 with x2:
-    st.caption("Fast path: readable PDF/DOCX/TXT text is extracted locally before Groq is called. Scanned PDFs are rendered locally and analyzed with Groq vision only when necessary.")
+    st.caption("Fast path: readable PDF/DOCX/TXT text is extracted locally before Gemini is called. Scanned PDFs are rendered locally and analyzed with Gemini vision only when necessary.")
 
 if analyze:
     if not uploads:
@@ -203,7 +203,7 @@ if analyze:
             file_records, _ = analyze_report(raw, uploaded.name, MODEL, API_KEY)
             records.extend(file_records)
             summaries.append({"Report":uploaded.name,"Activities":len(file_records),"Status":"Done"})
-        except GroqError as exc:
+        except GeminiError as exc:
             summaries.append({"Report":uploaded.name,"Activities":0,"Status":f"AI Error: {exc}"})
         except Exception as exc:
             summaries.append({"Report":uploaded.name,"Activities":0,"Status":f"Error: {exc}"})
