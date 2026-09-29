@@ -19,8 +19,8 @@ class GeminiError(RuntimeError):
     pass
 
 
-# These are documentary evidence categories inside the uploaded activity document.
-# No separate photograph upload/evidence module is used.
+# Documentary evidence categories that may be present inside the uploaded activity file.
+# This does NOT mean a separate photo-evidence module is used.
 DOCUMENT_TYPES = [
     "Proposal",
     "Notice",
@@ -39,35 +39,35 @@ DOCUMENT_TYPES = [
 
 
 class EvidenceItem(BaseModel):
-    document: str = "Not Identified"
-    status: str = "Not Identified"
-    source_page: str = "Not Identified"
+    document: str = Field(default="Not Identified")
+    status: str = Field(default="Not Identified")
+    source_page: str = Field(default="Not Identified")
 
 
 class Activity(BaseModel):
-    academic_year: str = "Not Identified"
-    activity_date: str = "Not Identified"
-    activity_title: str = "Not Identified"
-    activity_type: str = "Not Identified"
-    category: str = "Not Identified"
-    organizing_department_committee: str = "Not Identified"
-    collaborating_agency: str = "Not Identified"
-    resource_person: str = "Not Identified"
-    venue: str = "Not Identified"
-    participants: str = "Not Identified"
-    objective: str = "Not Identified"
-    activity_description: str = "Not Identified"
-    outcome: str = "Not Identified"
-    follow_up_action: str = "Not Identified"
-    feedback: str = "Not Identified"
-    naac_attribute: str = "Not Identified"
-    naac_metric: str = "Not Identified"
+    academic_year: str = Field(default="Not Identified")
+    activity_date: str = Field(default="Not Identified")
+    activity_title: str = Field(default="Not Identified")
+    activity_type: str = Field(default="Not Identified")
+    category: str = Field(default="Not Identified")
+    organizing_department_committee: str = Field(default="Not Identified")
+    collaborating_agency: str = Field(default="Not Identified")
+    resource_person: str = Field(default="Not Identified")
+    venue: str = Field(default="Not Identified")
+    participants: str = Field(default="Not Identified")
+    objective: str = Field(default="Not Identified")
+    activity_description: str = Field(default="Not Identified")
+    outcome: str = Field(default="Not Identified")
+    follow_up_action: str = Field(default="Not Identified")
+    feedback: str = Field(default="Not Identified")
+    naac_attribute: str = Field(default="Not Identified")
+    naac_metric: str = Field(default="Not Identified")
     evidence: list[EvidenceItem] = Field(default_factory=list)
-    source_page: str = "Not Identified"
+    source_page: str = Field(default="Not Identified")
 
 
 class ReportAnalysis(BaseModel):
-    academic_year: str = "Not Identified"
+    academic_year: str = Field(default="Not Identified")
     activities: list[Activity] = Field(default_factory=list)
 
 
@@ -230,63 +230,16 @@ def _extract_local_text(raw: bytes, filename: str) -> tuple[str, bool]:
     return "", False
 
 
-def _schema() -> dict[str, Any]:
-    evidence_item = {
-        "type": "object",
-        "properties": {
-            "document": {"type": "string"},
-            "status": {
-                "type": "string",
-                "enum": ["Present", "Absent", "Not Identified"],
-            },
-            "source_page": {"type": "string"},
-        },
-        "required": ["document", "status", "source_page"],
-        "additionalProperties": False,
-    }
-
-    field_names = [
-        "academic_year",
-        "activity_date",
-        "activity_title",
-        "activity_type",
-        "category",
-        "organizing_department_committee",
-        "collaborating_agency",
-        "resource_person",
-        "venue",
-        "participants",
-        "objective",
-        "activity_description",
-        "outcome",
-        "follow_up_action",
-        "feedback",
-        "naac_attribute",
-        "naac_metric",
-        "source_page",
-    ]
-    properties = {name: {"type": "string"} for name in field_names}
-    properties["evidence"] = {"type": "array", "items": evidence_item}
-
-    activity_schema = {
-        "type": "object",
-        "properties": properties,
-        "required": field_names + ["evidence"],
-        "additionalProperties": False,
-    }
-
-    return {
-        "type": "object",
-        "properties": {
-            "academic_year": {"type": "string"},
-            "activities": {"type": "array", "items": activity_schema},
-        },
-        "required": ["academic_year", "activities"],
-        "additionalProperties": False,
-    }
-
-
 def _generate(client: Any, model: str, contents: Any) -> ReportAnalysis:
+    """
+    Generate structured output using the Pydantic model directly.
+
+    The previous implementation manually passed a JSON-schema dictionary to
+    response_schema. That caused Gemini REST payload errors around
+    `additional_properties` with the google-genai SDK. The SDK officially
+    supports passing a Pydantic class directly as response_schema, so we use
+    ReportAnalysis here and avoid hand-built schema translation entirely.
+    """
     try:
         from google.genai import types
 
@@ -297,20 +250,32 @@ def _generate(client: Any, model: str, contents: Any) -> ReportAnalysis:
                 system_instruction=SYSTEM_PROMPT,
                 temperature=0,
                 response_mime_type="application/json",
-                response_schema=_schema(),
+                response_schema=ReportAnalysis,
             ),
         )
     except Exception as exc:
         raise GeminiError(str(exc)) from exc
+
+    parsed = getattr(response, "parsed", None)
+    if parsed is not None:
+        try:
+            if isinstance(parsed, ReportAnalysis):
+                return parsed
+            return ReportAnalysis.model_validate(parsed)
+        except Exception:
+            pass
 
     text = getattr(response, "text", "") or ""
     if not text:
         raise GeminiError("Gemini returned an empty response.")
 
     try:
-        return ReportAnalysis.model_validate(json.loads(text))
-    except Exception as exc:
-        raise GeminiError(f"Gemini returned invalid structured data: {exc}") from exc
+        return ReportAnalysis.model_validate_json(text)
+    except Exception:
+        try:
+            return ReportAnalysis.model_validate(json.loads(text))
+        except Exception as exc:
+            raise GeminiError(f"Gemini returned invalid structured data: {exc}") from exc
 
 
 def _upload_pdf(client: Any, raw: bytes, filename: str):
@@ -344,7 +309,6 @@ def _map_evidence(activity: Activity) -> tuple[str, str]:
     for document_name in DOCUMENT_TYPES:
         item = evidence_by_name.get(_normalize_document_name(document_name))
         if not item:
-            # Defensive fallback. The schema/prompt should normally prevent this.
             absent.append(document_name)
             continue
 
