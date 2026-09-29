@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import io
 import json
 import os
@@ -8,15 +7,16 @@ import re
 import time
 from pathlib import Path
 from typing import Any
-from functools import lru_cache
 
+from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field
 
 from .record_utils import normalize_record
 
 
-class GroqError(RuntimeError):
-    pass
+class GeminiError(RuntimeError):
+    """User-facing error raised for Gemini configuration/API failures."""
 
 
 DOCUMENT_TYPES = [
@@ -62,102 +62,43 @@ class ReportAnalysis(BaseModel):
 
 SYSTEM_PROMPT = f"""
 You are the primary information-extraction engine for a college IQAC document system.
-Your task is NOT simple keyword filling. Read and understand the COMPLETE supplied report, including headings, paragraphs, tables, notices, schedules, attendance sections, event reports, conclusions, feedback sections, captions and evidence lists. Then convert the information into structured activity records.
+Read and understand the supplied report, including headings, paragraphs, tables, notices,
+schedules, attendance sections, event reports, conclusions, feedback sections, captions and
+evidence lists. Return structured activity records only.
 
 CORE PRINCIPLE
-Extract intelligently from context while remaining factual.
-- If the document clearly states something but does not use the exact field label, map it to the appropriate field.
-- Do NOT require labels such as 'Venue:', 'Participants:' or 'Objective:' when the meaning is clear from surrounding text.
-- You may combine closely related statements from different parts of the SAME report when they clearly refer to the same activity.
-- Do not use general world knowledge to fill a factual field.
+- Extract facts from the supplied document only.
+- Map information by meaning, not only by field labels.
 - Do not invent names, numbers, dates, outcomes, agencies, locations or actions.
-- If the report truly does not support a field, use exactly "Not Identified".
-- Preserve the document's actual names, dates, numbers and terminology.
+- If a field is genuinely unsupported, use exactly "Not Identified".
+- Preserve actual names, dates, numbers and terminology.
+- Do not create separate activities for notices, attendance sheets, photos, feedback pages,
+  certificates or other evidence belonging to the same event.
+- If the report contains several unrelated events, create one activity for each.
 
-ACTIVITY DETECTION
-1. Identify every distinct genuine activity in the report.
-2. One distinct activity = one Activity object.
-3. Do not create separate activities for a notice, attendance sheet, photographs, feedback page or other evidence belonging to the same event.
-4. If one report contains several unrelated events, create one object for each event.
-5. If a report has a title/header and then detailed sections for one event, consolidate them into one record.
-6. Supporting documents are evidence for an activity, not separate activities.
-
-FIELD EXTRACTION — USE CONTEXT, NOT ONLY LABELS
-Academic Year:
-- Use the explicitly stated academic year, session or reporting year.
-- A report-level academic year may be applied to activities when it clearly governs the whole report.
-
-Activity Date:
-- Extract the actual event/activity date.
-- Do not confuse publication date, submission date or approval date with event date.
-- If multiple dates are present, select the date that clearly belongs to the activity.
-
-Activity Title:
-- Prefer the formal event/activity title from the heading, title block, notice, schedule or event report.
-- Do not replace a specific title with a generic category.
-
-Activity Type:
-- Identify the type from the report context, such as workshop, seminar, competition, awareness programme, extension activity, field visit, training, lecture, campaign, drive, celebration, sports activity, cultural activity, outreach activity, etc.
-
-Category:
-- Capture the report's own category/type when explicitly stated.
-- If a clear category is evident from the activity description, map it conservatively.
-
-Organizing Department / Committee:
-- Look for department, committee, cell, NSS, student association, club, IQAC, NCC, examination committee, etc.
-- Also recognize phrases such as 'organized by', 'conducted by', 'under the guidance of', 'through', 'coordinated by', when they clearly identify the organizing unit.
-
-Collaborating Agency:
-- Extract external/internal partners, institutions, NGOs, companies, government bodies, associations or agencies described as collaborators, partners, co-organizers or institutions in association with the activity.
-- Do not put the college's own organizing department here unless it is explicitly a collaborating organization.
-
-Resource Person:
-- Extract speaker, expert, trainer, guest, chief guest, invited resource person, facilitator, judge or other named person who delivered/contributed to the activity.
-- If several clearly relevant persons exist, list them concisely.
-- A coordinator should not automatically be treated as a resource person.
-
-Venue:
-- Extract the actual place/location where the activity occurred.
-- Recognize 'held at', 'conducted at', 'venue', 'place', 'location', room/building names and outdoor locations.
-
-Participants:
-- Extract participant groups and counts from the whole report.
-- Use attendance counts, volunteer counts, registration counts, participant statements and tables when they clearly refer to the activity.
-- Preserve both count and group, e.g. '72 NSS Volunteers'.
-- Do not calculate a number unless the report itself provides enough information to make the total explicit.
-
-Objective:
-- Extract stated aims, purposes, objectives, intended goals or reasons for conducting the activity.
-- Recognize objective statements even when they occur in prose rather than under an 'Objective' heading.
-- Keep objectives separate from what actually happened and from reported outcomes.
-
-Activity Description:
-- Summarize what was actually conducted, using only information from the report.
-- Include important programme components, methodology, major activities, sessions or sequence when clearly described.
-- This field can be a concise synthesis of multiple factual statements from the report.
-
-Outcome:
-- Extract reported results, impact, benefits, achievements, learning, awareness created or other consequences explicitly stated in the report.
-- Do not turn objectives into outcomes.
-- Do not invent an outcome simply because an activity normally would have one.
-
-Follow-up Action:
-- Extract explicit future actions, continuation plans, recommendations, next steps, monitoring, subsequent programmes or commitments.
-- If the report only describes the completed event, use Not Identified.
-
-Feedback:
-- Extract actual participant/stakeholder feedback information, feedback summary or feedback-related findings.
-- If the report states that feedback was collected but does not give its content, say 'Feedback collected' rather than inventing comments.
-- Do not confuse a feedback form with the content of feedback.
-
-SOURCE PAGE
-- Use the PDF page number(s) where the activity itself is supported.
-- If the information comes from several pages, give a compact range/list such as '2-4' or '2, 5'.
-- For DOCX/TXT, use 'Not Identified' unless the source itself provides page numbers.
+FIELD RULES
+Academic Year: use the explicitly stated academic year/session/reporting year.
+Activity Date: use the actual event date, not submission/publication/approval dates.
+Activity Title: prefer the formal event/activity title from headings, notices, schedules or reports.
+Activity Type: classify conservatively (workshop, seminar, competition, awareness programme,
+field visit, training, lecture, campaign, drive, celebration, sports, cultural, outreach, etc.).
+Category: use the report's stated category; otherwise infer conservatively from clear context.
+Organizing Department / Committee: identify the actual organizing unit.
+Collaborating Agency: identify partners/co-organizers/external agencies; do not duplicate the
+college organizing unit unless it is explicitly a collaborator.
+Resource Person: identify speakers, experts, trainers, guests, judges or facilitators.
+Venue: identify the actual location of the activity.
+Participants: preserve counts and groups when explicitly supported; do not calculate unsupported totals.
+Objective: extract stated aims/purposes, not outcomes.
+Activity Description: concise factual synthesis of what actually happened.
+Outcome: extract reported results, impact, learning or benefits; never invent them.
+Follow-up Action: extract explicit future actions, recommendations or continuation plans.
+Feedback: extract actual feedback information; if only collection is stated, say "Feedback collected".
+Source Page: use PDF page numbers supporting the activity. For DOCX/TXT use Not Identified unless
+page numbers are explicitly available.
 
 NAAC MAPPING
-Select ONE best-fit Attribute and ONE best-fit Metric for each activity.
-Use the following internal reference catalog exactly:
+Select ONE best-fit Attribute and ONE best-fit Metric per activity using this internal reference:
 1 Curriculum Design: 1.1-1.8
 2 Faculty Resources: 2.1, 2.2, 2.3, 2.7
 3 Infrastructure: 3.1-3.6
@@ -168,95 +109,43 @@ Use the following internal reference catalog exactly:
 8 Student Outcomes: 8.1-8.8
 9 Research & Innovation Outcomes: 9.1-9.9
 10 Sustainability Outcomes (Including Green Initiatives): 10.1-10.5
+Useful internal examples: technical/student extension activities -> 6.1; cultural -> 6.2;
+wellbeing/health -> 6.3; value education/ethics -> 6.4; sports -> 6.5;
+community service/NSS/UBA/outreach -> 6.6; IQAC/quality assurance -> 7.6;
+explicit environmental/green initiatives -> 10.4. These are internal reference mappings,
+not an official accreditation determination.
 
-Use the activity's actual purpose and content, not merely words in its title.
-Useful internal examples:
-- Technical/domain-oriented student activities, competitions and similar extension activities → Attribute 6; Metric 6.1 when clearly supported.
-- Cultural activities → 6.2 when clearly supported.
-- Student wellbeing/health activities → 6.3 when clearly supported.
-- Value education/ethics → 6.4 when clearly supported.
-- Sports activities → 6.5 when clearly supported.
-- Community service/NSS/UBA/community outreach → 6.6 when clearly supported.
-- IQAC/quality assurance activities → 7.6 when clearly supported.
-- Explicit environmental/green initiatives such as tree plantation → Attribute 10; Metric 10.4 when clearly supported.
-These are internal reference mappings, not an official accreditation determination.
-Do not force a mapping when the activity genuinely provides insufficient information.
-
-DOCUMENT EVIDENCE — COMPLETE CHECKLIST
-You MUST return exactly one EvidenceItem for EVERY document type below, in the same order:
+DOCUMENT EVIDENCE
+Return exactly one EvidenceItem for EVERY document type below, in this exact order:
 {', '.join(DOCUMENT_TYPES)}
-
-For each evidence type:
-- Present = the supplied report actually contains that evidence, or clearly identifies it as part of the report.
-- Absent = the report has been sufficiently checked and that evidence is not present.
-- Not Identified = the document is ambiguous, unreadable, or the available material does not allow a reliable determination.
-- Never infer evidence merely because the activity exists.
-- For Present, give the PDF page where it appears when possible.
-- For Absent/Not Identified, source_page = Not Identified.
-- If the report explicitly says an evidence item is 'NA', 'not available', 'not attached', etc., treat that as Absent.
-- If an event report contains embedded photographs, mark Photographs as Present.
-- If those photographs are explicitly identified as geotagged/location-tagged, mark Geotagged Photographs as Present; do not assume every photograph is geotagged.
-- If the report has an attendance list/table, mark Attendance as Present.
-- If it has a feedback form, feedback summary or feedback analysis, mark the corresponding evidence type as Present only according to what is actually shown.
-- Do not confuse a mention of a document with the document itself unless the report clearly identifies it as attached/included.
-
-QUALITY RULES
-- Never leave a field as Not Identified merely because the report used different wording.
-- Prefer a concise factual value over a vague value.
-- Do not copy huge paragraphs into individual fields.
-- Preserve important counts and names exactly.
-- When several pages contain complementary information for the same event, consolidate them.
-- Never create facts to make a record look complete.
-""".strip()
+Status rules:
+- Present = the supplied report actually contains or clearly identifies the evidence.
+- Absent = the report has been sufficiently checked and the evidence is not present.
+- Not Identified = ambiguous, unreadable, or impossible to determine reliably.
+- Never infer evidence merely because an activity exists.
+- For Present, give PDF page where possible.
+- For Absent/Not Identified, source_page must be "Not Identified".
+- If explicitly marked NA/not available/not attached, treat it as Absent.
+"""
 
 RECOVERY_PROMPT = """
-Re-read the COMPLETE supplied document as an experienced college IQAC records officer.
-The previous pass did not produce usable activity records. Look beyond literal field labels: use headings, paragraphs, tables, notices, event descriptions, attendance, evidence sections and conclusions to identify genuine activities and extract the information that is actually present.
-Return at least one activity when the document clearly describes one. Missing facts should remain Not Identified, but do not mark a clearly stated fact as Not Identified merely because it is expressed indirectly.
-""".strip()
+Re-read the supplied document and perform a conservative recovery pass. Return only the
+structured IQAC extraction. Merge evidence belonging to the same activity. Do not invent facts.
+"""
 
 
-@lru_cache(maxsize=4)
 def _client(api_key: str):
-    try:
-        from groq import Groq
-        return Groq(api_key=api_key)
-    except Exception as exc:
-        raise GroqError(f"Groq SDK is not available: {exc}") from exc
-
-
-def check_connection(api_key: str, model: str) -> tuple[bool, str]:
     if not api_key.strip():
-        return False, "GROQ_API_KEY is not configured."
-    try:
-        client = _client(api_key)
-        model_ids = set()
-        try:
-            for item in client.models.list().data:
-                model_ids.add(getattr(item, "id", ""))
-        except Exception:
-            pass
-        if model_ids and model not in model_ids:
-            return False, f"Groq model '{model}' is not available for this account."
-        return True, f"Groq is configured ({model})."
-    except Exception as exc:
-        return False, f"Groq connection/model check failed: {exc}"
-
-
-def _is_transient(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(x in msg for x in (
-        "429", "500", "502", "503", "504", "timeout", "timed out",
-        "unavailable", "overloaded", "resource exhausted", "deadline exceeded",
-    ))
+        raise GeminiError("GEMINI_API_KEY is not configured.")
+    return genai.Client(api_key=api_key.strip())
 
 
 def _extract_local_text(raw: bytes, filename: str) -> tuple[str, bool, str]:
     suffix = Path(filename).suffix.lower()
     try:
         if suffix == ".txt":
-            text = raw.decode("utf-8", errors="replace").strip()
-            return text, bool(text), "local-text"
+            text = raw.decode("utf-8", errors="ignore").strip()
+            return text, len(text) >= 80, "local-text"
         if suffix == ".docx":
             from docx import Document
             doc = Document(io.BytesIO(raw))
@@ -283,186 +172,193 @@ def _extract_local_text(raw: bytes, filename: str) -> tuple[str, bool, str]:
                     useful_pages += 1
                 total += len(text)
                 pages.append(f"\n--- PDF PAGE {page_no} ---\n{text}")
+            page_count = max(1, len(pages))
             doc.close()
             result = "\n".join(pages).strip()
-            page_count = max(1, len(pages))
             usable = total >= 500 and (useful_pages / page_count) >= 0.45
-            return result, usable, "local-pdf-text" if usable else "pdf-visual-fallback"
+            return result, usable, "local-pdf-text" if usable else "gemini-pdf"
     except Exception:
         return "", False, "extraction-failed"
     return "", False, "unsupported"
 
 
 def _strict_schema() -> dict[str, Any]:
-    evidence_properties = {
-        "document": {"type": "string"},
-        "status": {"type": "string"},
-        "source_page": {"type": "string"},
-    }
-    activity_fields = [
-        "academic_year", "activity_date", "activity_title", "activity_type", "category",
-        "organizing_department_committee", "collaborating_agency", "resource_person", "venue",
-        "participants", "objective", "activity_description", "outcome", "follow_up_action",
-        "feedback", "naac_attribute", "naac_metric", "source_page",
-    ]
-    activity_props = {name: {"type": "string"} for name in activity_fields}
-    activity_props["evidence"] = {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": evidence_properties,
-            "required": ["document", "status", "source_page"],
-            "additionalProperties": False,
-        },
-    }
-    return {
-        "type": "object",
-        "properties": {
-            "academic_year": {"type": "string"},
-            "activities": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": activity_props,
-                    "required": activity_fields + ["evidence"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "required": ["academic_year", "activities"],
-        "additionalProperties": False,
-    }
+    return ReportAnalysis.model_json_schema()
 
 
-def _generate(client: Any, model: str, messages: list[dict[str, Any]]) -> ReportAnalysis:
+def _generate(client: Any, model: str, contents: Any, recovery: bool = False) -> ReportAnalysis:
     try:
-        response = client.chat.completions.create(
+        response = client.models.generate_content(
             model=model,
-            messages=messages,
-            temperature=0,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "iqac_report_analysis",
-                    "strict": True,
-                    "schema": _strict_schema(),
-                },
-            },
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=RECOVERY_PROMPT if recovery else SYSTEM_PROMPT,
+                temperature=0,
+                max_output_tokens=8192,
+                response_mime_type="application/json",
+                response_schema=_strict_schema(),
+            ),
         )
     except Exception as exc:
-        raise GroqError(str(exc)) from exc
+        raise GeminiError(_friendly_error(exc)) from exc
 
-    try:
-        text = response.choices[0].message.content or ""
-    except Exception as exc:
-        raise GroqError(f"Groq returned an unreadable response: {exc}") from exc
+    text = getattr(response, "text", None) or ""
     if not text:
-        raise GroqError("Groq returned an empty response.")
+        raise GeminiError("Gemini returned an empty response.")
     try:
-        return ReportAnalysis.model_validate(json.loads(text))
+        return ReportAnalysis.model_validate_json(text)
     except Exception as exc:
-        raise GroqError(f"Groq returned invalid structured data: {exc}") from exc
+        try:
+            return ReportAnalysis.model_validate(json.loads(text))
+        except Exception as inner:
+            raise GeminiError(f"Gemini returned invalid structured JSON: {inner}") from exc
 
 
-def _image_data_url(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
-    return f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+def _wait_until_active(client: Any, uploaded_file: Any, timeout: int = 120) -> Any:
+    state = getattr(uploaded_file, "state", None)
+    state_name = getattr(state, "name", str(state)) if state is not None else "ACTIVE"
+    started = time.time()
+    current = uploaded_file
+    while state_name == "PROCESSING" and time.time() - started < timeout:
+        time.sleep(1.5)
+        current = client.files.get(name=current.name)
+        state = getattr(current, "state", None)
+        state_name = getattr(state, "name", str(state)) if state is not None else "ACTIVE"
+    if state_name == "FAILED":
+        raise GeminiError("Gemini could not process the uploaded document.")
+    if state_name == "PROCESSING":
+        raise GeminiError("Gemini file processing timed out. Please retry the document.")
+    return current
 
 
-def _render_pdf_image_batches(raw: bytes, pages_per_image: int = 2, max_images: int = 3) -> list[list[dict[str, str]]]:
-    """Render scanned PDF pages into groups of up to 3 image inputs.
-
-    Groq's current Qwen vision models accept up to 3 images per request, so two
-    PDF pages are placed into each image canvas to balance OCR legibility and
-    request count.
-    """
-    import fitz
-    from PIL import Image, ImageDraw
-
-    doc = fitz.open(stream=raw, filetype="pdf")
-    rendered: list[dict[str, str]] = []
+def _analyze_pdf(client: Any, model: str, raw: bytes, filename: str) -> ReportAnalysis:
+    uploaded = None
     try:
-        for page_no, page in enumerate(doc, start=1):
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
-            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            img.thumbnail((1100, 1500), Image.Resampling.LANCZOS)
-            canvas = Image.new("RGB", (1120, 1540), "white")
-            x = (canvas.width - img.width) // 2
-            y = (canvas.height - img.height) // 2 + 18
-            canvas.paste(img, (x, y))
-            draw = ImageDraw.Draw(canvas)
-            draw.text((18, 6), f"PDF PAGE {page_no}", fill="black")
-            buf = io.BytesIO()
-            canvas.save(buf, format="JPEG", quality=78, optimize=True)
-            rendered.append({"page": str(page_no), "url": _image_data_url(buf.getvalue())})
+        uploaded = client.files.upload(
+            file=io.BytesIO(raw),
+            config={"display_name": filename, "mime_type": "application/pdf"},
+        )
+        uploaded = _wait_until_active(client, uploaded)
+        prompt = (
+            f"SOURCE FILE: {filename}\n\n"
+            "Analyze the complete PDF. Identify every distinct IQAC activity and consolidate all "
+            "supporting evidence belonging to each activity. Pay attention to tables, images, "
+            "captions, attendance, schedules and page numbers. Return only the required JSON structure."
+        )
+        return _generate(client, model, [uploaded, prompt])
     finally:
-        doc.close()
-
-    batches: list[list[dict[str, str]]] = []
-    step = pages_per_image
-    for i in range(0, len(rendered), max_images * step):
-        chunk = rendered[i:i + max_images * step]
-        # Each API image represents one PDF page to keep the vision model's OCR readable.
-        for j in range(0, len(chunk), max_images):
-            batches.append(chunk[j:j + max_images])
-    return batches
+        if uploaded is not None:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
-def _vision_messages(prompt: str, image_items: list[dict[str, str]]) -> list[dict[str, Any]]:
-    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for item in image_items:
-        content.append({"type": "image_url", "image_url": {"url": item["url"]}})
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": content},
-    ]
+def _analyze_text(client: Any, model: str, text: str, filename: str) -> ReportAnalysis:
+    if len(text) > 240_000:
+        text = text[:240_000] + "\n--- DOCUMENT TEXT TRUNCATED ---"
+    prompt = (
+        f"SOURCE FILE: {filename}\n\n"
+        "Analyze the complete extracted document text below. Identify every distinct IQAC activity "
+        "and consolidate supporting evidence belonging to each activity.\n\nDOCUMENT TEXT:\n" + text
+    )
+    return _generate(client, model, prompt)
 
 
-def _merge_text_analyses(results: list[ReportAnalysis]) -> ReportAnalysis:
+def _analyze_once(raw: bytes, filename: str, model: str, api_key: str) -> ReportAnalysis:
+    client = _client(api_key)
+    suffix = Path(filename).suffix.lower()
+    text, usable, method = _extract_local_text(raw, filename)
+    if suffix == ".pdf":
+        # Gemini's native PDF understanding is preferable because it can interpret both text
+        # and visual evidence in the same request. This is especially useful for scanned IQAC reports.
+        return _analyze_pdf(client, model, raw, filename)
+    if usable:
+        return _analyze_text(client, model, text, filename)
+    raise GeminiError(f"Could not extract usable content from {filename}.")
+
+
+def _recover(raw: bytes, filename: str, model: str, api_key: str) -> ReportAnalysis:
+    client = _client(api_key)
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".pdf":
+        uploaded = None
+        try:
+            uploaded = client.files.upload(
+                file=io.BytesIO(raw),
+                config={"display_name": filename, "mime_type": "application/pdf"},
+            )
+            uploaded = _wait_until_active(client, uploaded)
+            return _generate(
+                client,
+                model,
+                [uploaded, f"SOURCE FILE: {filename}\n{RECOVERY_PROMPT}"],
+                recovery=True,
+            )
+        finally:
+            if uploaded is not None:
+                try:
+                    client.files.delete(name=uploaded.name)
+                except Exception:
+                    pass
+    text, usable, _ = _extract_local_text(raw, filename)
+    if usable:
+        return _generate(client, model, f"SOURCE FILE: {filename}\n{RECOVERY_PROMPT}\n{text}", recovery=True)
+    return ReportAnalysis()
+
+
+def _norm_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _merge_activities(old: Activity, new: Activity) -> Activity:
+    data = old.model_dump()
+
+    def choose(a: str, b: str) -> str:
+        if (not a or a == "Not Identified") and b and b != "Not Identified":
+            return b
+        return a or "Not Identified"
+
+    for field in data:
+        if field != "evidence":
+            data[field] = choose(str(data[field]), str(getattr(new, field)))
+
+    evidence: dict[str, EvidenceItem] = {
+        _norm_key(e.document): e for e in old.evidence if e.document.strip()
+    }
+    rank = {"present": 3, "not identified": 2, "absent": 1}
+    for item in new.evidence:
+        key = _norm_key(item.document)
+        if not key:
+            continue
+        if key not in evidence or rank.get(item.status.lower(), 2) > rank.get(evidence[key].status.lower(), 2):
+            evidence[key] = item
+        elif evidence[key].source_page == "Not Identified" and item.source_page != "Not Identified":
+            evidence[key] = item
+    data["evidence"] = list(evidence.values())
+    return Activity.model_validate(data)
+
+
+def _merge_results(results: list[ReportAnalysis]) -> ReportAnalysis:
     if not results:
         return ReportAnalysis()
-    academic_year = next((r.academic_year for r in results if r.academic_year != "Not Identified"), "Not Identified")
     merged: list[Activity] = []
+    academic_year = next(
+        (r.academic_year for r in results if r.academic_year != "Not Identified"),
+        "Not Identified",
+    )
 
     def norm(v: str) -> str:
-        return re.sub(r"[^a-z0-9]+", " ", (v or "").lower()).strip()
-
-    def choose(old: str, new: str) -> str:
-        if (not old or old == "Not Identified") and new and new != "Not Identified":
-            return new
-        return old or "Not Identified"
+        return _norm_key(v)
 
     def similar(a: Activity, b: Activity) -> bool:
         ta, tb = norm(a.activity_title), norm(b.activity_title)
         da, db = norm(a.activity_date), norm(b.activity_date)
         if ta and tb and ta != "not identified" and tb != "not identified":
-            if ta == tb or ta in tb or tb in ta:
-                return da == db or "not identified" in (da, db) or not da or not db
+            return (ta == tb or ta in tb or tb in ta) and (
+                da == db or "not identified" in (da, db) or not da or not db
+            )
         return False
-
-    def merge_activity(old: Activity, new: Activity) -> Activity:
-        merged_data = old.model_dump()
-        for field in merged_data:
-            if field == "evidence":
-                continue
-            merged_data[field] = choose(str(merged_data[field]), str(getattr(new, field)))
-        ev_map: dict[str, EvidenceItem] = {_norm_key(e.document): e for e in old.evidence if e.document.strip()}
-        for e in new.evidence:
-            key = _norm_key(e.document)
-            if not key:
-                continue
-            if key not in ev_map:
-                ev_map[key] = e
-            else:
-                cur = ev_map[key]
-                rank = {"present": 3, "not identified": 2, "absent": 1}
-                cur_rank = rank.get(cur.status.strip().lower(), 2)
-                new_rank = rank.get(e.status.strip().lower(), 2)
-                if new_rank > cur_rank:
-                    ev_map[key] = e
-                elif cur.source_page == "Not Identified" and e.source_page != "Not Identified":
-                    cur.source_page = e.source_page
-        merged_data["evidence"] = list(ev_map.values())
-        return Activity.model_validate(merged_data)
 
     for result in results:
         for activity in result.activities:
@@ -470,54 +366,8 @@ def _merge_text_analyses(results: list[ReportAnalysis]) -> ReportAnalysis:
             if hit is None:
                 merged.append(activity)
             else:
-                merged[hit] = merge_activity(merged[hit], activity)
+                merged[hit] = _merge_activities(merged[hit], activity)
     return ReportAnalysis(academic_year=academic_year, activities=merged)
-
-
-def _analyze_once(raw: bytes, filename: str, model: str, api_key: str) -> ReportAnalysis:
-    client = _client(api_key)
-    text, usable, method = _extract_local_text(raw, filename)
-    prompt = SYSTEM_PROMPT + f"\n\nSOURCE FILE: {filename}\nPROCESSING MODE: {method}"
-    if usable:
-        if len(text) > 220_000:
-            text = text[:220_000] + "\n--- DOCUMENT TEXT TRUNCATED ---"
-        return _generate(client, model, [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt + "\nDOCUMENT TEXT:\n" + text},
-        ])
-
-    suffix = Path(filename).suffix.lower()
-    if suffix != ".pdf":
-        raise GroqError(f"Groq vision fallback is currently implemented for PDF files; could not extract usable text from {filename}.")
-
-    batches = _render_pdf_image_batches(raw)
-    results: list[ReportAnalysis] = []
-    for batch in batches:
-        page_list = ", ".join(x["page"] for x in batch)
-        batch_prompt = (
-            f"{prompt}\n\nThis is a PARTIAL visual batch from the report, containing PDF page(s) {page_list}. "
-            "Extract only information actually supported by these pages. Do not assume that missing fields are absent from the full report. "
-            "You may return partial activity objects; later batches will be merged. Because this is only a partial batch, do not mark an evidence item Absent unless the page itself explicitly says it is absent; otherwise use Not Identified."
-        )
-        results.append(_generate(client, model, _vision_messages(batch_prompt, batch)))
-    return _merge_text_analyses(results)
-
-
-def _recover(raw: bytes, filename: str, model: str, api_key: str) -> ReportAnalysis:
-    client = _client(api_key)
-    text, usable, method = _extract_local_text(raw, filename)
-    if usable:
-        if len(text) > 220_000:
-            text = text[:220_000]
-        return _generate(client, model, [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": RECOVERY_PROMPT + f"\nSOURCE FILE: {filename}\nPROCESSING MODE: {method}\n" + text},
-        ])
-    return _analyze_once(raw, filename, model, api_key)
-
-
-def _norm_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
 
 def _map_activity(activity: Activity, source_report: str, index: int, report_year: str) -> dict[str, str]:
@@ -537,12 +387,9 @@ def _map_activity(activity: Activity, source_report: str, index: int, report_yea
         else:
             not_identified.append(doc_name)
 
-    # Keep the main two requested columns, while preserving uncertainty clearly.
+    absent_display = "; ".join(absent) if absent else "None Identified"
     if not_identified:
-        absent_display = "; ".join(absent) if absent else "None Identified"
         absent_display += " | Not Identified: " + "; ".join(not_identified)
-    else:
-        absent_display = "; ".join(absent) if absent else "None Identified"
 
     raw = {
         "Record ID": f"IQAC-{index:04d}",
@@ -571,30 +418,48 @@ def _map_activity(activity: Activity, source_report: str, index: int, report_yea
     return normalize_record(raw, source_report, index)
 
 
+def _is_retryable(message: str) -> bool:
+    text = message.lower()
+    return any(token in text for token in ("429", "503", "500", "temporarily unavailable", "deadline exceeded"))
+
+
+def _friendly_error(exc: Exception) -> str:
+    text = str(exc)
+    low = text.lower()
+    if "api key" in low or "unauthenticated" in low or "invalid_argument" in low and "key" in low:
+        return "Gemini API key is invalid. Create a Gemini API key in Google AI Studio and set GEMINI_API_KEY in Streamlit Secrets."
+    if "quota" in low or "resource_exhausted" in low or "429" in low:
+        return "Gemini free-tier quota/rate limit was reached. Wait for the quota window to reset or use another eligible Gemini model/project."
+    if "413" in low or "too large" in low:
+        return "The document/request is too large for the current Gemini request. Try a smaller file or split the report."
+    return text
+
+
 def analyze_report(raw: bytes, filename: str, model: str, api_key: str) -> tuple[list[dict[str, str]], dict[str, str]]:
     if not api_key.strip():
-        raise GroqError("GROQ_API_KEY is not configured.")
+        raise GeminiError("GEMINI_API_KEY is not configured.")
 
-    selected_model = model or "qwen/qwen3.8-27b"
+    selected_model = model or "gemini-2.5-flash-lite"
     last_error: Exception | None = None
     result: ReportAnalysis | None = None
 
-    # One retry for short-lived transport/service errors only. Daily quota errors
-    # are surfaced immediately so the app does not burn time on useless retries.
     for attempt in range(2):
         try:
             result = _analyze_once(raw, filename, selected_model, api_key)
             break
+        except GeminiError as exc:
+            last_error = exc
+            if attempt == 1 or not _is_retryable(str(exc)):
+                break
+            time.sleep(2.0 * (2 ** attempt))
         except Exception as exc:
             last_error = exc
-            msg = str(exc).lower()
-            daily_quota = "rpd" in msg or "requests per day" in msg or "daily" in msg and "quota" in msg
-            if daily_quota or not _is_transient(exc) or attempt == 1:
+            if attempt == 1 or not _is_retryable(str(exc)):
                 break
-            time.sleep(1.5 * (2 ** attempt))
+            time.sleep(2.0 * (2 ** attempt))
 
     if result is None:
-        raise GroqError(f"Analysis failed for {filename}: {last_error}") from last_error
+        raise GeminiError(f"Analysis failed for {filename}: {last_error}") from last_error
 
     if not result.activities:
         try:
