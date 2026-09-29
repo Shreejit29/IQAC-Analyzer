@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import re
-import tempfile
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -249,6 +247,7 @@ def _generate(client: Any, model: str, contents: Any) -> ReportAnalysis:
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 temperature=0,
+                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
                 response_mime_type="application/json",
                 response_schema=ReportAnalysis,
             ),
@@ -276,20 +275,6 @@ def _generate(client: Any, model: str, contents: Any) -> ReportAnalysis:
             return ReportAnalysis.model_validate(json.loads(text))
         except Exception as exc:
             raise GeminiError(f"Gemini returned invalid structured data: {exc}") from exc
-
-
-def _upload_pdf(client: Any, raw: bytes, filename: str):
-    suffix = Path(filename).suffix or ".pdf"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(raw)
-        tmp_path = tmp.name
-    try:
-        return client.files.upload(file=tmp_path)
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
 
 
 def _normalize_document_name(value: str) -> str:
@@ -409,8 +394,15 @@ def analyze_report(
 
     try:
         if suffix == ".pdf":
-            uploaded = _upload_pdf(client, raw, filename)
-            result = _generate_with_retry(client, model, [prompt, uploaded])
+            # Inline PDF input avoids the extra Files API upload round-trip for
+            # one-shot analysis. Gemini supports inline PDFs up to 50 MB.
+            from google.genai import types
+
+            pdf_part = types.Part.from_bytes(
+                data=raw,
+                mime_type="application/pdf",
+            )
+            result = _generate_with_retry(client, model, [prompt, pdf_part])
         else:
             text, usable = _extract_local_text(raw, filename)
             if not usable:
