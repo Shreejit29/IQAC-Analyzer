@@ -158,15 +158,101 @@ OUTPUT QUALITY
 """.strip()
 
 
+class _CompletionResponse:
+    def __init__(self, payload: dict[str, Any]):
+        self._payload = payload
+        self.choices = [
+            type("Choice", (), {
+                "message": type("Message", (), {
+                    "content": ((item.get("message") or {}).get("content"))
+                })(),
+                "finish_reason": item.get("finish_reason"),
+            })()
+            for item in (payload.get("choices") or [])
+        ]
+
+
+class _ModelsAPI:
+    def __init__(self, client: "_ExperientialClient"):
+        self._client = client
+
+    def list(self):
+        response = self._client._request("GET", "/models")
+        data = [type("Model", (), item)() for item in response.get("data", [])]
+        return type("ModelsResponse", (), {"data": data})()
+
+
+class _CompletionsAPI:
+    def __init__(self, client: "_ExperientialClient"):
+        self._client = client
+
+    def create(self, **payload: Any):
+        response = self._client._request("POST", "/chat/completions", json_body=payload)
+        return _CompletionResponse(response)
+
+
+class _ChatAPI:
+    def __init__(self, client: "_ExperientialClient"):
+        self.completions = _CompletionsAPI(client)
+
+
+class _ExperientialClient:
+    """Small OpenAI-wire client using requests; no provider SDK is required."""
+
+    def __init__(self, api_key: str, base_url: str, timeout: float = 180.0):
+        try:
+            import requests
+        except Exception as exc:
+            raise AIEngineError(f"The requests package is not available: {exc}") from exc
+
+        self._requests = requests
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.models = _ModelsAPI(self)
+        self.chat = _ChatAPI(self)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        response = self._requests.request(
+            method,
+            url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=json_body,
+            timeout=self.timeout,
+        )
+
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {"error": {"message": response.text[:1000]}}
+
+        if not response.ok:
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if isinstance(error, dict):
+                message = error.get("message") or str(error)
+            else:
+                message = str(payload)
+            raise AIEngineError(f"Experiential API HTTP {response.status_code}: {message}")
+
+        if not isinstance(payload, dict):
+            raise AIEngineError("Experiential API returned a non-object response.")
+        return payload
+
+
 @lru_cache(maxsize=8)
 def _client(api_key: str, base_url: str):
-    """Create one OpenAI-compatible client per credential/base-url pair."""
-    try:
-        from openai import OpenAI
-
-        return OpenAI(api_key=api_key, base_url=base_url)
-    except Exception as exc:
-        raise AIEngineError(f"OpenAI-compatible SDK is not available: {exc}") from exc
+    """Create one Experiential client per credential/base-url pair."""
+    return _ExperientialClient(api_key=api_key, base_url=base_url)
 
 
 def _list_models(client: Any) -> set[str]:
@@ -220,14 +306,48 @@ def _is_retryable(exc: Exception) -> bool:
     )
 
 
+def _ocr_pdf_page(page: Any, page_number: int) -> str:
+    """OCR one PDF page for scanned/image-only documents.
+
+    OCR is intentionally used only for pages that do not contain enough native
+    PDF text. This keeps normal digital PDFs fast while allowing scanned
+    certificates, notices, reports and forms to be analyzed.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+    except Exception as exc:
+        raise AIEngineError(
+            "OCR support is not installed. Install pytesseract and Pillow to analyze scanned PDFs."
+        ) from exc
+
+    try:
+        # 200 DPI is a practical compromise for college documents: enough
+        # resolution for normal printed text without making OCR excessively slow.
+        pix = page.get_pixmap(dpi=200, alpha=False)
+        image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        text = pytesseract.image_to_string(image, config="--psm 6")
+        text = text.strip()
+        if text:
+            return f"[OCR TEXT — PAGE {page_number}]\n{text}"
+        return "[OCR COMPLETED — NO READABLE TEXT DETECTED]"
+    except Exception as exc:
+        raise AIEngineError(
+            f"OCR failed on PDF page {page_number}: {exc}"
+        ) from exc
+
+
 def _extract_local_pdf_text(raw: bytes) -> tuple[str, bool]:
-    """Extract PDF text with explicit page markers and embedded-image hints."""
+    """Extract PDF text, with OCR fallback for scanned/image-only pages."""
+    doc = None
     try:
         import fitz
 
         doc = fitz.open(stream=raw, filetype="pdf")
         chunks: list[str] = []
         total_text_chars = 0
+        pages_needing_ocr: list[tuple[int, Any]] = []
+
         for page_index, page in enumerate(doc, start=1):
             page_text = page.get_text("text").strip()
             image_count = len(page.get_images(full=True))
@@ -235,17 +355,47 @@ def _extract_local_pdf_text(raw: bytes) -> tuple[str, bool]:
             if image_count:
                 marker += f" [PAGE_HAS_EMBEDDED_IMAGES:{image_count}]"
             chunks.append(marker)
-            if page_text:
+
+            # A page with only a tiny amount of native text is often a scanned
+            # page with a header/footer. Queue it for OCR rather than assuming
+            # that the PDF is fully searchable.
+            if len(page_text) < 40:
+                pages_needing_ocr.append((page_index, page))
+                if page_text:
+                    chunks.append(page_text)
+                    total_text_chars += len(page_text)
+                else:
+                    chunks.append("[NO EXTRACTABLE TEXT — OCR PENDING]")
+            else:
                 chunks.append(page_text)
                 total_text_chars += len(page_text)
-            else:
-                chunks.append("[NO EXTRACTABLE TEXT ON THIS PAGE]")
             chunks.append("")
-        doc.close()
+
+        # Only OCR when the PDF does not already have enough searchable text.
+        # This prevents a performance penalty on normal digital PDFs.
+        if total_text_chars < 40 and pages_needing_ocr:
+            for page_number, page in pages_needing_ocr:
+                ocr_text = _ocr_pdf_page(page, page_number)
+                chunks.append(ocr_text)
+                chunks.append("")
+        elif pages_needing_ocr:
+            # Mixed PDFs can contain a few scanned pages. OCR only those pages
+            # when the document already has substantial native text.
+            for page_number, page in pages_needing_ocr:
+                ocr_text = _ocr_pdf_page(page, page_number)
+                chunks.append(ocr_text)
+                chunks.append("")
+
         text = "\n".join(chunks).strip()
-        return text, total_text_chars >= 40
-    except Exception:
-        return "", False
+        usable_chars = sum(1 for ch in text if not ch.isspace())
+        return text, usable_chars >= 40
+    except AIEngineError:
+        raise
+    except Exception as exc:
+        raise AIEngineError(f"PDF extraction/OCR failed: {exc}") from exc
+    finally:
+        if doc is not None:
+            doc.close()
 
 
 def _extract_local_text(raw: bytes, filename: str) -> tuple[str, bool]:
