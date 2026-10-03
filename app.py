@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from src.ai_engine import GeminiError, analyze_report
+from src.ai_engine import AIEngineError, analyze_report
 from src.excel_exporter import build_excel_bytes
 from src.record_utils import COLUMNS
 
@@ -29,8 +29,9 @@ def setting(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
-MODEL = setting("GEMINI_MODEL", "gemini-3.5-flash-lite")
-API_KEY = setting("GEMINI_API_KEY")
+MODEL = setting("EXPERIENTIAL_MODEL", "deepseek-v4-flash-0731")
+API_KEY = setting("EXPLABS_API_KEY")
+BASE_URL = setting("EXPERIENTIAL_BASE_URL", "https://api.experientiallabs.ai/v1")
 INSTITUTION = setting(
     "INSTITUTION_NAME", "Ramsheth Thakur College of Commerce & Science"
 )
@@ -483,7 +484,7 @@ def render_stats(file_count: int, activity_count: int, analyzed: bool) -> None:
         )
     with stat3:
         status = "Ready" if API_KEY else "Not configured"
-        note = "Gemini connection available" if API_KEY else "Add GEMINI_API_KEY"
+        note = "Experiential gateway configured" if API_KEY else "Add EXPLABS_API_KEY"
         st.markdown(
             f"<div class='status-card'><div class='status-label'>AI Status</div>"
             f"<div class='status-value'>{status}</div>"
@@ -508,7 +509,7 @@ st.markdown(
       <div class='subtitle'>Analyze activity documents and build one clean, reviewable IQAC Master Data table with activity details, conservative NAAC mapping, document presence/absence, and source-page traceability.</div>
       <div class='institution-line'>{INSTITUTION}</div>
     </div>
-    <div class='model-badge'><span class='model-dot'></span> Gemini 3.5 Flash-Lite</div>
+    <div class='model-badge'><span class='model-dot'></span> Experiential · {MODEL}</div>
   </div>
 </div>
 """,
@@ -518,7 +519,7 @@ st.markdown(
 render_workflow(4 if st.session_state.analysis_done and st.session_state.records else (3 if st.session_state.analysis_done else 1))
 
 if not API_KEY:
-    st.error("Gemini API is not configured. Add GEMINI_API_KEY to Streamlit Secrets.")
+    st.error("Experiential Labs API is not configured. Add EXPLABS_API_KEY to Streamlit Secrets.")
     st.stop()
 
 st.markdown(
@@ -594,8 +595,8 @@ if analyze:
     total = len(uploads)
 
     # Performance optimization: analyze a few documents concurrently instead of
-    # waiting for every Gemini request to finish before starting the next one.
-    # Three workers keeps the app responsive without flooding the free-tier API.
+    # waiting for every AI request to finish before starting the next one.
+    # Three workers keeps the app responsive without flooding the provider gateway.
     max_workers = min(3, total)
     jobs: list[tuple[int, str, bytes]] = []
     for idx, uploaded in enumerate(uploads):
@@ -615,6 +616,7 @@ if analyze:
             filename=filename,
             model=MODEL,
             api_key=API_KEY,
+            base_url=BASE_URL,
         )
         return idx, filename, records, summary
 
@@ -627,7 +629,7 @@ if analyze:
             try:
                 idx, filename, records, summary = future.result()
                 results[idx] = (filename, records, summary)
-            except GeminiError as exc:
+            except AIEngineError as exc:
                 idx, filename, _ = job
                 results[idx] = (filename, [], {"error": str(exc)})
             except Exception as exc:
