@@ -1,3 +1,13 @@
-# Staff Instructions
+Staff Instructions
 
-Upload PDF/DOCX/TXT activity reports, click Analyze Documents, review the extracted rows, correct any values if necessary, and download the Excel master sheet.
+Upload the PDF, DOCX, or TXT activity reports.
+
+Click Analyze Documents.
+
+Review the extracted activity rows carefully.
+
+Correct any values that need manual verification.
+
+Download the Excel master sheet.
+
+The AI provider is configured by the administrator, so staff do not need to enter or manage API keys or model settings.
