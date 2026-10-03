@@ -4,7 +4,7 @@ import sys
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from src.ai_engine import Activity, EvidenceItem, ReportAnalysis, _schema
+from src.ai_engine import Activity, EvidenceItem, ReportAnalysis, _response_schema
 from src.excel_exporter import build_excel_bytes
 from src.record_utils import COLUMNS, normalize_record
 
@@ -43,9 +43,10 @@ analysis = ReportAnalysis(
     ],
 )
 assert analysis.activities[0].activity_title == "AI and Robotics Workshop"
-schema = _schema()
+schema = _response_schema()
 assert schema["additionalProperties"] is False
-assert schema["properties"]["activities"]["items"]["additionalProperties"] is False
+activity_schema = schema.get("$defs", {}).get("Activity", {})
+assert activity_schema.get("additionalProperties") is False
 
 xlsx = build_excel_bytes([sample])
 assert xlsx[:2] == b"PK"
