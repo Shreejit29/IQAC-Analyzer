@@ -13,8 +13,13 @@ from pydantic import BaseModel, Field
 from .record_utils import normalize_record
 
 
-class GeminiError(RuntimeError):
-    pass
+class AIEngineError(RuntimeError):
+    """Provider-neutral error raised by the IQAC AI analysis layer."""
+
+
+# Backward-compatible alias for the current app while the UI/config file is
+# migrated from Gemini-specific naming to provider-neutral naming.
+GeminiError = AIEngineError
 
 
 # Documentary evidence categories that may be present inside the uploaded activity file.
@@ -134,13 +139,13 @@ Return exactly one EvidenceItem for every type, in this exact order:
 {', '.join(DOCUMENT_TYPES)}
 
 Status must be exactly one of: Present, Absent, Not Identified.
-- Present: the uploaded document visibly/explicitly contains that evidence.
-- Absent: the uploaded document has been sufficiently checked and that evidence is not present.
-- Not Identified: the file is ambiguous/unreadable or does not allow a reliable determination.
+- Present: the supplied document text explicitly/visibly establishes that evidence.
+- Absent: the supplied document has been sufficiently checked and that evidence is not present.
+- Not Identified: the file is ambiguous, image-only, unreadable, or otherwise does not allow a reliable determination.
 - Never infer that evidence exists because an activity normally has it.
 - "Attendance will be taken" does not make Attendance Present.
 - An attendance sheet/table makes Attendance Present.
-- Visible photographs embedded in the supplied document make Photographs Present.
+- When a PDF extraction note explicitly states that embedded images exist on a page, treat that as evidence of embedded visual content; classify it as Photographs only when the surrounding document context supports that they are event photographs. Otherwise use Not Identified.
 - Do not separately process or require photo uploads.
 - If a section explicitly says a document is not attached/not available/NA, mark Absent.
 - For Present, source_page must show where it appears. For Absent and Not Identified use "Not Identified".
@@ -153,33 +158,45 @@ OUTPUT QUALITY
 """.strip()
 
 
-@lru_cache(maxsize=4)
-def _client(api_key: str):
+@lru_cache(maxsize=8)
+def _client(api_key: str, base_url: str):
+    """Create one OpenAI-compatible client per credential/base-url pair."""
     try:
-        from google import genai
-        return genai.Client(api_key=api_key)
+        from openai import OpenAI
+
+        return OpenAI(api_key=api_key, base_url=base_url)
     except Exception as exc:
-        raise GeminiError(f"Gemini SDK is not available: {exc}") from exc
+        raise AIEngineError(f"OpenAI-compatible SDK is not available: {exc}") from exc
 
 
-def check_connection(api_key: str, model: str) -> tuple[bool, str]:
+def _list_models(client: Any) -> set[str]:
+    model_ids: set[str] = set()
+    response = client.models.list()
+    for item in response.data:
+        model_id = getattr(item, "id", "") or getattr(item, "name", "")
+        model_id = str(model_id).strip().replace("models/", "")
+        if model_id:
+            model_ids.add(model_id)
+    return model_ids
+
+
+def check_connection(api_key: str, model: str, base_url: str = "https://api.experientiallabs.ai/v1") -> tuple[bool, str]:
+    """Validate credentials and, when available, confirm the model slug."""
     if not api_key.strip():
-        return False, "GEMINI_API_KEY is not configured."
+        return False, "EXPLABS_API_KEY is not configured."
     try:
-        client = _client(api_key)
+        client = _client(api_key.strip(), base_url.strip())
         model_ids: set[str] = set()
         try:
-            for item in client.models.list():
-                model_name = getattr(item, "name", "") or getattr(item, "id", "")
-                model_ids.add(str(model_name).replace("models/", ""))
+            model_ids = _list_models(client)
         except Exception:
-            # A models-list failure should not prevent actual document analysis.
+            # Model-list failure should not block an actual inference call.
             pass
         if model_ids and model not in model_ids:
-            return False, f"Gemini model '{model}' is not available for this account."
-        return True, f"Gemini is configured ({model})."
+            return False, f"AI model '{model}' is not available for this account."
+        return True, f"AI gateway is configured ({model})."
     except Exception as exc:
-        return False, f"Gemini connection/model check failed: {exc}"
+        return False, f"AI gateway connection/model check failed: {exc}"
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -196,8 +213,39 @@ def _is_retryable(exc: Exception) -> bool:
             "timed out",
             "unavailable",
             "resource exhausted",
+            "rate limit",
+            "temporarily unavailable",
+            "internal server error",
         )
     )
+
+
+def _extract_local_pdf_text(raw: bytes) -> tuple[str, bool]:
+    """Extract PDF text with explicit page markers and embedded-image hints."""
+    try:
+        import fitz
+
+        doc = fitz.open(stream=raw, filetype="pdf")
+        chunks: list[str] = []
+        total_text_chars = 0
+        for page_index, page in enumerate(doc, start=1):
+            page_text = page.get_text("text").strip()
+            image_count = len(page.get_images(full=True))
+            marker = f"[PDF PAGE {page_index}]"
+            if image_count:
+                marker += f" [PAGE_HAS_EMBEDDED_IMAGES:{image_count}]"
+            chunks.append(marker)
+            if page_text:
+                chunks.append(page_text)
+                total_text_chars += len(page_text)
+            else:
+                chunks.append("[NO EXTRACTABLE TEXT ON THIS PAGE]")
+            chunks.append("")
+        doc.close()
+        text = "\n".join(chunks).strip()
+        return text, total_text_chars >= 40
+    except Exception:
+        return "", False
 
 
 def _extract_local_text(raw: bytes, filename: str) -> tuple[str, bool]:
@@ -206,6 +254,9 @@ def _extract_local_text(raw: bytes, filename: str) -> tuple[str, bool]:
         if suffix == ".txt":
             text = raw.decode("utf-8", errors="replace").strip()
             return text, bool(text)
+
+        if suffix == ".pdf":
+            return _extract_local_pdf_text(raw)
 
         if suffix == ".docx":
             from docx import Document
@@ -228,53 +279,86 @@ def _extract_local_text(raw: bytes, filename: str) -> tuple[str, bool]:
     return "", False
 
 
-def _generate(client: Any, model: str, contents: Any) -> ReportAnalysis:
-    """
-    Generate structured output using the Pydantic model directly.
+def _strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Pydantic's JSON schema for strict structured output."""
+    schema = json.loads(json.dumps(schema))
 
-    The previous implementation manually passed a JSON-schema dictionary to
-    response_schema. That caused Gemini REST payload errors around
-    `additional_properties` with the google-genai SDK. The SDK officially
-    supports passing a Pydantic class directly as response_schema, so we use
-    ReportAnalysis here and avoid hand-built schema translation entirely.
-    """
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "object":
+                properties = node.get("properties", {})
+                if properties:
+                    node["required"] = list(properties.keys())
+                node["additionalProperties"] = False
+                for child in properties.values():
+                    walk(child)
+            for key in ("$defs", "definitions"):
+                defs = node.get(key)
+                if isinstance(defs, dict):
+                    for child in defs.values():
+                        walk(child)
+            if "items" in node:
+                walk(node["items"])
+            for composition_key in ("anyOf", "oneOf", "allOf"):
+                values = node.get(composition_key)
+                if isinstance(values, list):
+                    for child in values:
+                        walk(child)
+
+    walk(schema)
+    return schema
+
+
+@lru_cache(maxsize=1)
+def _response_schema() -> dict[str, Any]:
+    return _strict_schema(ReportAnalysis.model_json_schema())
+
+
+def _generate(client: Any, model: str, prompt: str, document_text: str) -> ReportAnalysis:
+    """Generate strict structured output through the OpenAI-compatible gateway."""
     try:
-        from google.genai import types
-
-        response = client.models.generate_content(
+        response = client.chat.completions.create(
             model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0,
-                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
-                response_mime_type="application/json",
-                response_schema=ReportAnalysis,
-            ),
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"{prompt}\n\nSOURCE DOCUMENT:\n{document_text}",
+                },
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "iqac_report_analysis",
+                    "strict": True,
+                    "schema": _response_schema(),
+                },
+            },
+            max_tokens=12000,
         )
     except Exception as exc:
-        raise GeminiError(str(exc)) from exc
-
-    parsed = getattr(response, "parsed", None)
-    if parsed is not None:
-        try:
-            if isinstance(parsed, ReportAnalysis):
-                return parsed
-            return ReportAnalysis.model_validate(parsed)
-        except Exception:
-            pass
-
-    text = getattr(response, "text", "") or ""
-    if not text:
-        raise GeminiError("Gemini returned an empty response.")
+        raise AIEngineError(str(exc)) from exc
 
     try:
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            raise AIEngineError("AI gateway returned no choices.")
+
+        message = getattr(choices[0], "message", None)
+        text = getattr(message, "content", None) if message is not None else None
+        text = (text or "").strip()
+        if not text:
+            finish_reason = getattr(choices[0], "finish_reason", None)
+            raise AIEngineError(
+                f"AI gateway returned an empty structured response"
+                + (f" (finish_reason={finish_reason})." if finish_reason else ".")
+            )
+
         return ReportAnalysis.model_validate_json(text)
-    except Exception:
-        try:
-            return ReportAnalysis.model_validate(json.loads(text))
-        except Exception as exc:
-            raise GeminiError(f"Gemini returned invalid structured data: {exc}") from exc
+    except AIEngineError:
+        raise
+    except Exception as exc:
+        raise AIEngineError(f"AI gateway returned invalid structured data: {exc}") from exc
 
 
 def _normalize_document_name(value: str) -> str:
@@ -294,7 +378,9 @@ def _map_evidence(activity: Activity) -> tuple[str, str]:
     for document_name in DOCUMENT_TYPES:
         item = evidence_by_name.get(_normalize_document_name(document_name))
         if not item:
-            absent.append(document_name)
+            # Do not silently downgrade a missing AI checklist row to Absent.
+            # The AI is required to return every row, but if it does not, preserve
+            # uncertainty rather than inventing a negative finding.
             continue
 
         status = item.status.strip().lower()
@@ -365,18 +451,18 @@ def _analysis_prompt() -> str:
     )
 
 
-def _generate_with_retry(client: Any, model: str, contents: Any) -> ReportAnalysis:
+def _generate_with_retry(client: Any, model: str, prompt: str, document_text: str) -> ReportAnalysis:
     last_error: Exception | None = None
     for attempt, delay in enumerate((0, 2, 5), start=1):
         if delay:
             time.sleep(delay)
         try:
-            return _generate(client, model, contents)
+            return _generate(client, model, prompt, document_text)
         except Exception as exc:
             last_error = exc
             if not _is_retryable(exc) or attempt == 3:
                 break
-    raise GeminiError(str(last_error) if last_error else "Gemini analysis failed.")
+    raise AIEngineError(str(last_error) if last_error else "AI analysis failed.")
 
 
 def analyze_report(
@@ -384,36 +470,30 @@ def analyze_report(
     filename: str,
     model: str,
     api_key: str,
+    base_url: str = "https://api.experientiallabs.ai/v1",
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if not api_key.strip():
-        raise GeminiError("GEMINI_API_KEY is not configured.")
+        raise AIEngineError("EXPLABS_API_KEY is not configured.")
 
-    client = _client(api_key)
-    suffix = Path(filename).suffix.lower()
+    if not model.strip():
+        raise AIEngineError("AI model is not configured.")
+
+    client = _client(api_key.strip(), base_url.strip())
     prompt = _analysis_prompt()
 
     try:
-        if suffix == ".pdf":
-            # Inline PDF input avoids the extra Files API upload round-trip for
-            # one-shot analysis. Gemini supports inline PDFs up to 50 MB.
-            from google.genai import types
-
-            pdf_part = types.Part.from_bytes(
-                data=raw,
-                mime_type="application/pdf",
+        document_text, usable = _extract_local_text(raw, filename)
+        if not usable:
+            raise AIEngineError(
+                f"Could not extract usable text from {filename}. "
+                "Please use a readable PDF/DOCX/TXT file. Image-only PDFs will need OCR/vision support."
             )
-            result = _generate_with_retry(client, model, [prompt, pdf_part])
-        else:
-            text, usable = _extract_local_text(raw, filename)
-            if not usable:
-                raise GeminiError(
-                    f"Could not extract usable text from {filename}. Please use a readable PDF/DOCX/TXT file."
-                )
-            result = _generate_with_retry(client, model, [prompt, text])
-    except GeminiError as exc:
-        raise GeminiError(f"Analysis failed for {filename}: {exc}") from exc
+
+        result = _generate_with_retry(client, model, prompt, document_text)
+    except AIEngineError as exc:
+        raise AIEngineError(f"Analysis failed for {filename}: {exc}") from exc
     except Exception as exc:
-        raise GeminiError(f"Analysis failed for {filename}: {exc}") from exc
+        raise AIEngineError(f"Analysis failed for {filename}: {exc}") from exc
 
     records = [
         _map_activity(activity, filename, index, result.academic_year)
