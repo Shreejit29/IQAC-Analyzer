@@ -17,87 +17,125 @@ def _clean(value: Any) -> str:
 
 
 def build_excel_bytes(documents: list[dict[str, Any]]) -> bytes:
+    """Create ONE general extraction worksheet for all document types.
+
+    The Activity Report Analyzer has its own exporter and is not affected by this file.
+    Every general-extractor document is represented in the single `General Extractor` sheet.
+    """
     wb = Workbook()
     ws = wb.active
-    ws.title = "Documents"
-    fields = wb.create_sheet("Extracted Fields")
-    tables = wb.create_sheet("Tables")
+    ws.title = "General Extractor"
 
-    navy, blue, light, white, border = "17365D", "2F75B5", "DCEAF7", "FFFFFF", "D6DEE8"
+    navy, blue, white, border = "17365D", "2F75B5", "FFFFFF", "D6DEE8"
     thin = Side(style="thin", color=border)
+    headers = [
+        "Source File", "Document Type", "Document Title", "Document Date",
+        "Academic Year", "Department / Organization", "Field", "Extracted Information",
+        "Category", "Source Page", "Confidence", "Summary / Context",
+    ]
 
-    def setup(sheet, title, headers):
-        sheet.sheet_view.showGridLines = False
-        last = get_column_letter(len(headers))
-        sheet.merge_cells(f"A1:{last}1")
-        sheet["A1"] = title
-        sheet["A1"].font = Font(name="Aptos Display", size=18, bold=True, color=white)
-        sheet["A1"].fill = PatternFill("solid", fgColor=navy)
-        sheet["A1"].alignment = Alignment(vertical="center")
-        sheet.row_dimensions[1].height = 32
-        sheet.merge_cells(f"A2:{last}2")
-        sheet["A2"] = f"General document extraction • {len(documents)} document(s) • Generated {datetime.now().strftime('%d %b %Y, %I:%M %p')}"
-        sheet["A2"].font = Font(name="Aptos", size=10, italic=True)
-        for i, h in enumerate(headers, 1):
-            c = sheet.cell(4, i, h)
-            c.fill = PatternFill("solid", fgColor=blue)
-            c.font = Font(name="Aptos", size=10, bold=True, color=white)
-            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            c.border = Border(bottom=thin)
-        sheet.freeze_panes = "A5"
+    ws.sheet_view.showGridLines = False
+    last = get_column_letter(len(headers))
+    ws.merge_cells(f"A1:{last}1")
+    ws["A1"] = "GENERAL DOCUMENT EXTRACTOR"
+    ws["A1"].font = Font(name="Aptos Display", size=18, bold=True, color=white)
+    ws["A1"].fill = PatternFill("solid", fgColor=navy)
+    ws["A1"].alignment = Alignment(vertical="center")
+    ws.row_dimensions[1].height = 32
 
-    doc_headers = ["Record ID", "Source File", "Document Type", "Document Title", "Document Date", "Academic Year", "Department / Organization", "Summary", "Key Entities", "Warnings"]
-    setup(ws, "GENERAL DOCUMENT INDEX", doc_headers)
-    for idx, item in enumerate(documents, 1):
-        r = idx + 4
-        vals = [
-            f"DOC-{idx:04d}", item["filename"], item["result"].document_type, item["result"].document_title,
-            item["result"].document_date, item["result"].academic_year, item["result"].organization_department,
-            item["result"].short_summary, "; ".join(item["result"].key_entities) or "Not Identified", item.get("warning") or "",
+    ws.merge_cells(f"A2:{last}2")
+    ws["A2"] = (
+        f"All document types • {len(documents)} document(s) • "
+        f"Generated {datetime.now().strftime('%d %b %Y, %I:%M %p')}"
+    )
+    ws["A2"].font = Font(name="Aptos", size=10, italic=True)
+
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(4, col, header)
+        cell.fill = PatternFill("solid", fgColor=blue)
+        cell.font = Font(name="Aptos", size=10, bold=True, color=white)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = Border(bottom=thin)
+
+    row = 5
+    for item in documents:
+        result = item["result"]
+        common = [
+            item["filename"], result.document_type, result.document_title,
+            result.document_date, result.academic_year, result.organization_department,
         ]
-        for col, value in enumerate(vals, 1):
-            c = ws.cell(r, col, _clean(value)); c.alignment = Alignment(vertical="top", wrap_text=True); c.border = Border(bottom=thin)
-    widths = [14, 34, 24, 38, 18, 18, 30, 55, 40, 55]
-    for i, w in enumerate(widths, 1): ws.column_dimensions[get_column_letter(i)].width = w
-    ws.auto_filter.ref = f"A4:J{max(4, len(documents)+4)}"
 
-    field_headers = ["Document", "Document Type", "Field", "Value", "Category", "Source Page", "Confidence"]
-    setup(fields, "DYNAMIC EXTRACTED FIELDS", field_headers)
-    row = 5
-    for item in documents:
-        for f in item["result"].fields:
-            vals = [item["filename"], item["result"].document_type, f.name, f.value, f.category, f.source_page, f.confidence]
-            for col, value in enumerate(vals, 1):
-                c = fields.cell(row, col, _clean(value)); c.alignment = Alignment(vertical="top", wrap_text=True); c.border = Border(bottom=thin)
+        # Document-level information is included as normal fields.
+        document_fields = [
+            ("Document Summary", result.short_summary, "Document", "Not Identified", "High"),
+        ]
+        if result.key_entities:
+            document_fields.append((
+                "Key Entities", "; ".join(result.key_entities), "Entities", "Not Identified", "High"
+            ))
+
+        extracted = list(document_fields)
+        for field in result.fields:
+            extracted.append((field.name, field.value, field.category, field.source_page, field.confidence))
+
+        # Keep table information in the SAME sheet instead of creating a Tables sheet.
+        # Each table cell becomes an extractable field with its table title and row/column context.
+        for table in result.tables:
+            table_headers = table.headers or [
+                f"Column {i + 1}"
+                for i in range(max((len(r) for r in table.rows), default=0))
+            ]
+            for row_index, values in enumerate(table.rows, 1):
+                for col_index, value in enumerate(values):
+                    col_name = (
+                        table_headers[col_index]
+                        if col_index < len(table_headers)
+                        else f"Column {col_index + 1}"
+                    )
+                    extracted.append((
+                        f"Table: {table.title} | Row {row_index} | {col_name}",
+                        value,
+                        "Table",
+                        table.source_page,
+                        "High",
+                    ))
+
+        if not extracted:
+            extracted.append(("Information", "Not Identified", "General", "Not Identified", "Low"))
+
+        for field_name, value, category, source_page, confidence in extracted:
+            values = common + [
+                field_name, value, category, source_page, confidence, result.short_summary
+            ]
+            for col, value in enumerate(values, 1):
+                cell = ws.cell(row, col, _clean(value))
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = Border(bottom=thin)
             row += 1
-    for i, w in enumerate([34, 24, 30, 65, 24, 16, 14], 1): fields.column_dimensions[get_column_letter(i)].width = w
-    fields.auto_filter.ref = f"A4:G{max(4, row-1)}"
 
-    table_headers = ["Document", "Document Type", "Table", "Source Page", "Column", "Value", "Row"]
-    setup(tables, "EXTRACTED TABLE CONTENT", table_headers)
-    row = 5
-    for item in documents:
-        for table in item["result"].tables:
-            headers = table.headers or [f"Column {i+1}" for i in range(max((len(x) for x in table.rows), default=0))]
-            for ridx, values in enumerate(table.rows, 1):
-                for cidx, value in enumerate(values):
-                    vals = [item["filename"], item["result"].document_type, table.title, table.source_page, headers[cidx] if cidx < len(headers) else f"Column {cidx+1}", value, ridx]
-                    for col, val in enumerate(vals, 1):
-                        c = tables.cell(row, col, _clean(val)); c.alignment = Alignment(vertical="top", wrap_text=True); c.border = Border(bottom=thin)
-                    row += 1
-    for i, w in enumerate([34, 24, 30, 16, 28, 60, 10], 1): tables.column_dimensions[get_column_letter(i)].width = w
-    tables.auto_filter.ref = f"A4:G{max(4, row-1)}"
+    widths = [
+        34, 24, 38, 18, 18, 30, 42, 65, 22, 16, 14, 55
+    ]
+    for i, width in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
 
-    for sheet in wb.worksheets:
-        sheet.sheet_properties.pageSetUpPr.fitToPage = True
-        sheet.page_setup.fitToWidth = 1
-        sheet.page_setup.fitToHeight = 0
-        sheet.page_setup.orientation = "landscape"
-        sheet.page_margins.left = sheet.page_margins.right = 0.25
-        sheet.page_margins.top = sheet.page_margins.bottom = 0.45
+    last_data_row = max(4, row - 1)
+    ws.auto_filter.ref = f"A4:{last}{last_data_row}"
+    ws.freeze_panes = "A5"
+
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.page_setup.orientation = "landscape"
+    ws.page_margins.left = ws.page_margins.right = 0.25
+    ws.page_margins.top = ws.page_margins.bottom = 0.45
 
     wb.properties.title = "General Document Extraction"
     wb.properties.creator = "IQAC Analyzer"
-    out = BytesIO(); wb.save(out); data = out.getvalue()
-    check = load_workbook(BytesIO(data), read_only=False, data_only=False); check.close()
+
+    out = BytesIO()
+    wb.save(out)
+    data = out.getvalue()
+    check = load_workbook(BytesIO(data), read_only=False, data_only=False)
+    check.close()
     return data
